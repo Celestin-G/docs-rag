@@ -1,0 +1,15 @@
+# Binary
+rag
+docs-rag
+
+# Environment
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
