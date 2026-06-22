@@ -1,73 +1,86 @@
 package embedder
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-
-	"github.com/openai/openai-go"
-	"github.com/openai/openai-go/option"
-	"github.com/openai/openai-go/packages/param"
+	"net/http"
+	"os"
 )
 
-const batchSize = 100
+// Dim is the embedding dimension produced by nomic-embed-text.
+const Dim = 768
 
-// Embedder wraps the OpenAI embeddings API.
+const defaultHost = "http://localhost:11434"
+const model = "nomic-embed-text"
+
+// Embedder calls the Ollama /api/embed endpoint.
 type Embedder struct {
-	client openai.Client
+	host   string
+	client *http.Client
 }
 
-// New creates an Embedder using the given OpenAI API key.
-func New(apiKey string) *Embedder {
-	return &Embedder{
-		client: openai.NewClient(option.WithAPIKey(apiKey)),
+// New creates an Embedder. Reads OLLAMA_HOST from the environment (default: http://localhost:11434).
+func New() *Embedder {
+	host := os.Getenv("OLLAMA_HOST")
+	if host == "" {
+		host = defaultHost
 	}
+	return &Embedder{host: host, client: &http.Client{}}
 }
 
 // Embed returns the embedding vector for a single text.
 func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
-	resp, err := e.client.Embeddings.New(ctx, openai.EmbeddingNewParams{
-		Input: openai.EmbeddingNewParamsInputUnion{OfString: param.NewOpt(text)},
-		Model: openai.EmbeddingModelTextEmbedding3Small,
-	})
+	vecs, err := e.embedMany(ctx, []string{text})
 	if err != nil {
-		return nil, fmt.Errorf("openai embed: %w", err)
+		return nil, err
 	}
-	if len(resp.Data) == 0 {
-		return nil, fmt.Errorf("openai embed: no data in response")
-	}
-	return toFloat32(resp.Data[0].Embedding), nil
+	return vecs[0], nil
 }
 
-// EmbedBatch returns embeddings for multiple texts, sending up to batchSize texts per API call.
+// EmbedBatch returns embeddings for multiple texts in a single Ollama call.
 func (e *Embedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
-	results := make([][]float32, len(texts))
-
-	for start := 0; start < len(texts); start += batchSize {
-		end := start + batchSize
-		if end > len(texts) {
-			end = len(texts)
-		}
-		batch := texts[start:end]
-
-		resp, err := e.client.Embeddings.New(ctx, openai.EmbeddingNewParams{
-			Input: openai.EmbeddingNewParamsInputUnion{OfArrayOfStrings: batch},
-			Model: openai.EmbeddingModelTextEmbedding3Small,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("openai batch embed [%d:%d]: %w", start, end, err)
-		}
-
-		for _, d := range resp.Data {
-			results[start+int(d.Index)] = toFloat32(d.Embedding)
-		}
-	}
-	return results, nil
+	return e.embedMany(ctx, texts)
 }
 
-func toFloat32(src []float64) []float32 {
-	out := make([]float32, len(src))
-	for i, v := range src {
-		out[i] = float32(v)
+type embedRequest struct {
+	Model string   `json:"model"`
+	Input []string `json:"input"`
+}
+
+type embedResponse struct {
+	Embeddings [][]float32 `json:"embeddings"`
+}
+
+func (e *Embedder) embedMany(ctx context.Context, texts []string) ([][]float32, error) {
+	body, err := json.Marshal(embedRequest{Model: model, Input: texts})
+	if err != nil {
+		return nil, err
 	}
-	return out
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.host+"/api/embed", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ollama embed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ollama embed: HTTP %d", resp.StatusCode)
+	}
+
+	var result embedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("ollama embed decode: %w", err)
+	}
+	if len(result.Embeddings) != len(texts) {
+		return nil, fmt.Errorf("ollama embed: expected %d vectors, got %d", len(texts), len(result.Embeddings))
+	}
+	return result.Embeddings, nil
 }

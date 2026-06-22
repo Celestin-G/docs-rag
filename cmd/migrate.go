@@ -8,21 +8,23 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// migrationSQL drops and recreates the table to handle dimension changes across runs.
 const migrationSQL = `
 CREATE EXTENSION IF NOT EXISTS vector;
 
-CREATE TABLE IF NOT EXISTS doc_chunks (
+DROP TABLE IF EXISTS doc_chunks;
+
+CREATE TABLE doc_chunks (
   id          SERIAL PRIMARY KEY,
   source_file TEXT NOT NULL,
   section     TEXT,
   content     TEXT NOT NULL,
-  embedding   vector(1536),
+  embedding   vector(768),
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS doc_chunks_embedding_idx
-  ON doc_chunks USING ivfflat (embedding vector_cosine_ops)
-  WITH (lists = 100);
+CREATE INDEX doc_chunks_embedding_idx
+  ON doc_chunks USING hnsw (embedding vector_cosine_ops);
 `
 
 var migrateCmd = &cobra.Command{

@@ -28,7 +28,6 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 	ctx := context.Background()
 
 	docsPath := mustEnv("DOCS_PATH")
-	openaiKey := mustEnv("OPENAI_API_KEY")
 	dbURL := mustEnv("DATABASE_URL")
 
 	clean, _ := cmd.Flags().GetBool("clean")
@@ -46,7 +45,7 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
-	emb := embedder.New(openaiKey)
+	emb := embedder.New()
 
 	var files []string
 	err = filepath.WalkDir(docsPath, func(path string, d os.DirEntry, err error) error {
@@ -61,7 +60,11 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(path))
-		if ext == ".md" || ext == ".mdx" {
+		if ext != ".md" && ext != ".mdx" {
+			return nil
+		}
+		rel, _ := filepath.Rel(docsPath, path)
+		if isDocFile(rel) {
 			files = append(files, path)
 		}
 		return nil
@@ -114,4 +117,19 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 
 	fmt.Fprintf(os.Stderr, "\nDone — ingested %d chunks from %d files.\n", totalChunks, len(files))
 	return nil
+}
+
+// isDocFile returns true only for files that are actual Formance user documentation.
+// This excludes project meta-files (CLAUDE.md, README.md at root) and internal
+// tooling packages (docs-framework, vcc) that pollute search results.
+func isDocFile(rel string) bool {
+	// Keep everything under apps/docs/content/ (pages + fragments)
+	if strings.HasPrefix(rel, "apps/docs/content/") {
+		return true
+	}
+	// Keep the numscript engine README which has useful technical content
+	if strings.HasPrefix(rel, "packages/numscript-engine/") {
+		return true
+	}
+	return false
 }

@@ -37,6 +37,7 @@ type DocChunk struct {
 	Section    string
 	Content    string
 	Embedding  []float32
+	Score      float32 // cosine similarity [0,1] — only set by Search
 }
 
 // Insert stores a single chunk in the database.
@@ -55,10 +56,11 @@ func (s *Store) Insert(ctx context.Context, chunk DocChunk) error {
 	return nil
 }
 
-// Search retrieves the top-k most similar chunks to the given embedding using cosine distance.
-func (s *Store) Search(ctx context.Context, embedding []float32, topK int) ([]DocChunk, error) {
+// Search retrieves the top-k most similar chunks to the given embedding using cosine similarity.
+// Only chunks with similarity >= minScore are returned (pass 0 to disable filtering).
+func (s *Store) Search(ctx context.Context, embedding []float32, topK int, minScore float32) ([]DocChunk, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT source_file, section, content
+		`SELECT source_file, section, content, 1 - (embedding <=> $1::vector) AS score
 		 FROM doc_chunks
 		 ORDER BY embedding <=> $1::vector
 		 LIMIT $2`,
@@ -73,8 +75,11 @@ func (s *Store) Search(ctx context.Context, embedding []float32, topK int) ([]Do
 	var results []DocChunk
 	for rows.Next() {
 		var c DocChunk
-		if err := rows.Scan(&c.SourceFile, &c.Section, &c.Content); err != nil {
+		if err := rows.Scan(&c.SourceFile, &c.Section, &c.Content, &c.Score); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		if minScore > 0 && c.Score < minScore {
+			continue
 		}
 		results = append(results, c)
 	}

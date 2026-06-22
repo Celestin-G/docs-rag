@@ -28,8 +28,6 @@ func runAsk(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
 	question := strings.Join(args, " ")
-	openaiKey := mustEnv("OPENAI_API_KEY")
-	anthropicKey := mustEnv("ANTHROPIC_API_KEY")
 	dbURL := mustEnv("DATABASE_URL")
 	topK, _ := cmd.Flags().GetInt("top-k")
 
@@ -39,7 +37,7 @@ func runAsk(cmd *cobra.Command, args []string) error {
 	}
 	defer st.Close()
 
-	emb := embedder.New(openaiKey)
+	emb := embedder.New()
 
 	fmt.Fprintln(os.Stderr, "Generating embedding for question...")
 	vec, err := emb.Embed(ctx, question)
@@ -48,7 +46,7 @@ func runAsk(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "Searching top %d chunks...\n", topK)
-	chunks, err := st.Search(ctx, vec, topK)
+	chunks, err := st.Search(ctx, vec, topK, 0)
 	if err != nil {
 		return fmt.Errorf("search: %w", err)
 	}
@@ -69,6 +67,6 @@ func runAsk(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	claude := llm.New(anthropicKey)
-	return claude.Ask(ctx, question, ctxChunks, os.Stdout)
+	claude := llm.New()
+	return claude.Ask(ctx, question, nil, ctxChunks, os.Stdout)
 }

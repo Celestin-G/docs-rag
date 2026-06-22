@@ -3,8 +3,97 @@ package chunker
 import (
 	"bufio"
 	"bytes"
+	"regexp"
 	"strings"
 )
+
+// MDX cleaning — applied outside code fences only.
+var (
+	fctlCmdRe      = regexp.MustCompile(`\{"([^"]+)"\}`)
+	docCardTitleRe = regexp.MustCompile(`title="([^"]+)"`)
+	jsxOpenStartRe = regexp.MustCompile(`^<[A-Z][A-Za-z.]*`)
+	jsxTagRe       = regexp.MustCompile(`</?[A-Z][A-Za-z.]*(?:\s[^>]*)?>`)
+	divTagRe       = regexp.MustCompile(`</?div(?:\s[^>]*)?>`)
+	multiBlankRe   = regexp.MustCompile(`\n{3,}`)
+)
+
+// stripMDX removes JSX/MDX components while preserving useful text content.
+// Code fences are left untouched. fctl commands and DocCard titles are extracted.
+func stripMDX(content []byte) []byte {
+	lines := strings.Split(string(content), "\n")
+	out := make([]string, 0, len(lines))
+	inCode := false
+	skipToClose := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Track code fences — never modify content inside them.
+		if strings.HasPrefix(trimmed, "```") {
+			inCode = !inCode
+			out = append(out, line)
+			continue
+		}
+		if inCode {
+			out = append(out, line)
+			continue
+		}
+
+		// Multi-line JSX opening tag: skip until the tag closes.
+		if skipToClose {
+			if strings.HasSuffix(trimmed, ">") || strings.HasSuffix(trimmed, "/>") {
+				skipToClose = false
+			}
+			continue
+		}
+
+		// Drop import statements.
+		if strings.HasPrefix(trimmed, "import ") && strings.Contains(trimmed, " from ") {
+			continue
+		}
+
+		// <DocAPI.Fctl>{"command"}</DocAPI.Fctl> → extract the command verbatim.
+		if strings.Contains(line, "<DocAPI.Fctl") {
+			if m := fctlCmdRe.FindStringSubmatch(line); len(m) > 1 {
+				out = append(out, m[1])
+			}
+			continue
+		}
+
+		// <DocCard title="X" ...> → emit the title as bold text.
+		if strings.Contains(trimmed, "<DocCard") {
+			if m := docCardTitleRe.FindStringSubmatch(trimmed); len(m) > 1 {
+				out = append(out, "**"+m[1]+"**")
+			}
+			if !strings.HasSuffix(trimmed, ">") {
+				skipToClose = true
+			}
+			continue
+		}
+
+		// Multi-line JSX opening tag with no closing > on this line.
+		if jsxOpenStartRe.MatchString(trimmed) &&
+			!strings.HasSuffix(trimmed, ">") &&
+			!strings.HasSuffix(trimmed, "/>") {
+			skipToClose = true
+			continue
+		}
+
+		// Strip single-line JSX and div tags, keep surrounding text.
+		cleaned := jsxTagRe.ReplaceAllString(line, "")
+		cleaned = divTagRe.ReplaceAllString(cleaned, "")
+
+		// Discard lines that were purely a JSX tag.
+		if strings.TrimSpace(cleaned) == "" && trimmed != "" {
+			continue
+		}
+		out = append(out, cleaned)
+	}
+
+	result := strings.Join(out, "\n")
+	result = multiBlankRe.ReplaceAllString(result, "\n\n")
+	return []byte(strings.TrimSpace(result))
+}
 
 // maxChunkBytes is ~500 tokens at ~4 chars/token.
 const maxChunkBytes = 2000
@@ -19,6 +108,7 @@ type Chunk struct {
 // ParseFile parses a markdown or MDX file and returns chunks split by H2/H3 headings.
 func ParseFile(relPath string, content []byte) []Chunk {
 	content = stripFrontmatter(content)
+	content = stripMDX(content)
 	sections := splitBySections(content)
 
 	var chunks []Chunk
@@ -28,10 +118,16 @@ func ParseFile(relPath string, content []byte) []Chunk {
 			continue
 		}
 		for _, part := range splitBySize(text, maxChunkBytes) {
+			// Prefix the section heading into the content so the embedding
+			// captures the topic label, not just the body text.
+			content := part
+			if s.heading != "" {
+				content = s.heading + "\n\n" + part
+			}
 			chunks = append(chunks, Chunk{
 				SourceFile: relPath,
 				Section:    s.heading,
-				Content:    part,
+				Content:    content,
 			})
 		}
 	}
@@ -70,20 +166,36 @@ func stripFrontmatter(content []byte) []byte {
 }
 
 // splitBySections splits the document by H2 (##) and H3 (###) headings.
+// H3 chunks inherit their parent H2 as a breadcrumb prefix ("H2 > H3") so
+// that embeddings capture the section hierarchy, not just the leaf label.
 func splitBySections(content []byte) []section {
 	var sections []section
 	var current section
 	var buf strings.Builder
+	var parentH2 string
 
 	scanner := bufio.NewScanner(bytes.NewReader(content))
 	for scanner.Scan() {
 		line := scanner.Text()
-		if isHeading(line) {
+		if isH2(line) {
 			if text := strings.TrimSpace(buf.String()); text != "" {
 				current.text = text
 				sections = append(sections, current)
 			}
-			current = section{heading: extractHeadingText(line)}
+			parentH2 = extractHeadingText(line)
+			current = section{heading: parentH2}
+			buf.Reset()
+		} else if isH3(line) {
+			if text := strings.TrimSpace(buf.String()); text != "" {
+				current.text = text
+				sections = append(sections, current)
+			}
+			h3 := extractHeadingText(line)
+			fullHeading := h3
+			if parentH2 != "" {
+				fullHeading = parentH2 + " > " + h3
+			}
+			current = section{heading: fullHeading}
 			buf.Reset()
 		} else {
 			buf.WriteString(line)
@@ -98,9 +210,12 @@ func splitBySections(content []byte) []section {
 	return sections
 }
 
-func isHeading(line string) bool {
-	return strings.HasPrefix(line, "## ") || strings.HasPrefix(line, "### ") ||
-		line == "##" || line == "###"
+func isH2(line string) bool {
+	return strings.HasPrefix(line, "## ") || line == "##"
+}
+
+func isH3(line string) bool {
+	return strings.HasPrefix(line, "### ") || line == "###"
 }
 
 func extractHeadingText(line string) string {
