@@ -37,6 +37,13 @@ type ContextChunk struct {
 	Content    string
 }
 
+// FilterContext describes the active user-selected filters.
+type FilterContext struct {
+	License    string // "ee" or "community"
+	Deployment string // "cloud", "self-hosted", "both"
+	Version    string // e.g. "3.2"
+}
+
 // Message is a single turn in the conversation history.
 type Message struct {
 	Role    string `json:"role"`    // "user" or "assistant"
@@ -94,13 +101,13 @@ func (c *Client) Translate(ctx context.Context, text string) (string, error) {
 
 // Ask streams a response. history contains all previous turns; chunks are the
 // RAG context retrieved for the current question.
-func (c *Client) Ask(ctx context.Context, question string, history []Message, chunks []ContextChunk, out io.Writer) error {
+func (c *Client) Ask(ctx context.Context, question string, history []Message, chunks []ContextChunk, filter FilterContext, out io.Writer) error {
 	messages := make([]Message, 0, len(history)+2)
 
 	// System message: role + RAG context for this turn
 	messages = append(messages, Message{
 		Role:    "system",
-		Content: buildSystem(chunks),
+		Content: buildSystem(chunks, filter),
 	})
 
 	// Full conversation history (all previous user+assistant turns)
@@ -149,10 +156,28 @@ func (c *Client) Ask(ctx context.Context, question string, history []Message, ch
 	return scanner.Err()
 }
 
-func buildSystem(chunks []ContextChunk) string {
+func buildSystem(chunks []ContextChunk, filter FilterContext) string {
 	var sb strings.Builder
 
 	sb.WriteString("You are a technical assistant for the Formance platform.\n\n")
+
+	// Inject active filter context so the LLM knows what is and isn't available.
+	sb.WriteString("## Active documentation filter\n")
+	if filter.Version != "" {
+		fmt.Fprintf(&sb, "- Stack version: v%s\n", filter.Version)
+	}
+	if filter.Deployment != "" && filter.Deployment != "both" {
+		fmt.Fprintf(&sb, "- Deployment: %s\n", filter.Deployment)
+	}
+	if filter.License == "community" {
+		sb.WriteString("- License: **Community edition**\n")
+		sb.WriteString("  The following Formance modules are EXCLUSIVELY for Enterprise (EE) customers and have been removed from the search results:\n")
+		sb.WriteString("  Wallets module, Flows module, Reconciliation module, SSO, RBAC, Audit Logs.\n")
+		sb.WriteString("  CRITICAL RULE: If the user's question is about any of these EE features — even indirectly (e.g. 'add funds to my wallet/portefeuille', 'create a flow', 'reconcile payments') — you MUST answer that this feature requires an Enterprise (EE) license and is not available in Community edition. Do NOT use PSP connector pages, Ledger pages, or any other tangentially related content to construct an answer for an EE-only question. Say clearly: this is an EE feature.\n")
+	} else {
+		sb.WriteString("- License: Enterprise (EE) — all features are available.\n")
+	}
+	sb.WriteString("\n")
 
 	sb.WriteString("## Technical facts — must come exclusively from the documentation excerpts below\n")
 	sb.WriteString("- API endpoints, HTTP methods, URL paths\n")
@@ -172,7 +197,9 @@ func buildSystem(chunks []ContextChunk) string {
 	sb.WriteString("## Hard rules\n")
 	sb.WriteString("- Never mix capabilities or behaviors across connectors — each connector has its own documented spec.\n")
 	sb.WriteString("- Never invent code, YAML, or JSON that is not present verbatim in the excerpts.\n")
-	sb.WriteString("- Always respond in the same language as the user's question.\n\n")
+	sb.WriteString("- Always respond in the same language as the user's question.\n")
+	sb.WriteString("- If the excerpts below do not contain information that directly answers the question, say so explicitly. Do NOT attempt to reconstruct an answer by combining loosely related excerpts. A clear 'I don't have documentation on this in the current filter context' is better than a synthesized guess.\n")
+	sb.WriteString("- If the question is about a feature that appears to be an Enterprise (EE) edition feature (Wallets, Flows, Reconciliation, SSO, RBAC, Audit Logs) but no relevant excerpts are present, explicitly tell the user that this feature may not be available in their current license or filter context.\n\n")
 
 	sb.WriteString("=== DOCUMENTATION ===\n\n")
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/celestingeniaut/docs-rag/internal/embedder"
@@ -35,9 +36,12 @@ func (s *srv) handleIndex(w http.ResponseWriter, _ *http.Request) {
 // --- /api/ask -----------------------------------------------------------------
 
 type askReq struct {
-	Question string        `json:"question"`
-	TopK     int           `json:"top_k"`
-	History  []llm.Message `json:"history"`
+	Question   string        `json:"question"`
+	TopK       int           `json:"top_k"`
+	History    []llm.Message `json:"history"`
+	Version    string        `json:"version"`    // "3.0","3.1","3.2","3.3"
+	Deployment string        `json:"deployment"` // "cloud","self-hosted","both"
+	License    string        `json:"license"`    // "ee","community"
 }
 
 type sseEvent struct {
@@ -108,10 +112,31 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Build search filter from request parameters.
+	filter := store.SearchFilter{
+		License:    req.License,
+		Deployment: req.Deployment,
+	}
+	if filter.License == "" {
+		filter.License = "ee"
+	}
+	if filter.Deployment == "" {
+		filter.Deployment = "both"
+	}
+	if req.Version != "" {
+		// "3.2" → 32, "3.0" → 30, etc.
+		parts := strings.SplitN(req.Version, ".", 2)
+		if len(parts) == 2 {
+			major, _ := strconv.Atoi(parts[0])
+			minor, _ := strconv.Atoi(parts[1])
+			filter.VersionNum = int16(major*10 + minor)
+		}
+	}
+
 	// Fetch more candidates than needed, then apply a diversity filter so no
 	// single file monopolises the context window (e.g. a long file whose
 	// "writes" section ranks 1st doesn't crowd out its own "reads" section).
-	rawChunks, err := s.store.Search(ctx, vec, req.TopK*2, 0.38)
+	rawChunks, err := s.store.Search(ctx, vec, req.TopK*2, 0.38, filter)
 	if err != nil {
 		send(sseEvent{Type: "error", Text: "Search failed: " + err.Error()})
 		return
@@ -142,7 +167,8 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 		ctxChunks[i] = llm.ContextChunk{SourceFile: c.SourceFile, Section: c.Section, Content: c.Content}
 	}
 
-	if err := s.llm.Ask(ctx, queryEn, req.History, ctxChunks, &sseWriter{w: w, flusher: flusher}); err != nil {
+	filterCtx := llm.FilterContext{License: req.License, Deployment: req.Deployment, Version: req.Version}
+	if err := s.llm.Ask(ctx, queryEn, req.History, ctxChunks, filterCtx, &sseWriter{w: w, flusher: flusher}); err != nil {
 		send(sseEvent{Type: "error", Text: "LLM error: " + err.Error()})
 		return
 	}
@@ -213,6 +239,11 @@ header{background:var(--emerald);height:48px;padding:0 24px;display:flex;align-i
 .bubble.a pre{background:var(--emerald);border-radius:3px;padding:12px 14px;margin:8px 0;overflow-x:auto}
 .bubble.a pre code{background:none;color:var(--mint);padding:0;font-size:12px}
 .bubble.a blockquote{border-left:3px solid var(--emerald-20);margin:6px 0;padding:2px 12px;color:var(--emerald-10)}
+.tbl-wrap{overflow-x:auto;margin:8px 0}
+.bubble.a table{border-collapse:collapse;width:100%;font-size:12px;font-family:var(--mono)}
+.bubble.a th{background:var(--emerald);color:var(--mint);font-size:11px;font-weight:500;letter-spacing:.04em;padding:6px 12px;text-align:left;border:1px solid var(--emerald-10)}
+.bubble.a td{padding:6px 12px;border:1px solid var(--slate);color:var(--emerald)}
+.bubble.a tr:nth-child(even) td{background:var(--slate-20)}
 /* Thinking words */
 .tw{font-family:var(--mono);font-size:13px;color:var(--emerald-10);font-style:italic}
 /* Send button loading dots */
@@ -231,8 +262,13 @@ header{background:var(--emerald);height:48px;padding:0 24px;display:flex;align-i
 .chip:hover{background:var(--emerald-10)}
 
 /* Input bar */
-#form-wrap{background:var(--slate-10);border-top:1px solid var(--emerald-20);padding:16px 24px;flex-shrink:0}
+#form-wrap{background:var(--slate-10);border-top:1px solid var(--emerald-20);padding:16px 24px;flex-shrink:0;position:relative}
 #form{max-width:760px;margin:0 auto;display:flex;align-items:stretch}
+#fsel-group{position:absolute;left:24px;top:50%;transform:translateY(-50%);display:flex;align-items:stretch}
+.fsel{height:44px;font-family:var(--mono);font-size:11px;color:var(--emerald);background:#fff;border:1px solid var(--emerald-20);border-right:none;padding:0 20px 0 10px;cursor:pointer;outline:none;letter-spacing:.02em;-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='4' viewBox='0 0 8 4'%3E%3Cpath d='M0 0l4 4 4-4z' fill='%231a3a2a' opacity='.3'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 6px center;transition:border-color .12s;box-sizing:border-box}
+.fsel:hover,.fsel:focus{border-color:var(--emerald)}
+#sel-version{border-radius:2px 0 0 2px}
+#sel-license{border-right:1px solid var(--emerald-20);border-radius:0 2px 2px 0}
 .prefix{font-family:var(--mono);font-size:14px;color:var(--gold);background:var(--emerald);padding:10px 12px;border-radius:2px 0 0 2px;display:flex;align-items:center;flex-shrink:0;user-select:none;border:1px solid var(--emerald);border-right:none}
 #q{flex:1;padding:10px 14px;border:1px solid var(--emerald-20);border-left:none;border-right:none;background:#fff;font-size:14px;font-family:var(--mono);resize:none;min-height:44px;max-height:160px;outline:none;line-height:1.5;color:var(--emerald);border-radius:0;transition:border-color .12s}
 #q::placeholder{color:var(--emerald-20)}
@@ -264,6 +300,23 @@ header{background:var(--emerald);height:48px;padding:0 24px;display:flex;align-i
 </div>
 
 <div id="form-wrap">
+  <div id="fsel-group">
+    <select id="sel-version" class="fsel">
+      <option value="3.0">v3.0</option>
+      <option value="3.1">v3.1</option>
+      <option value="3.2" selected>v3.2</option>
+      <option value="3.3">v3.3</option>
+    </select>
+    <select id="sel-deploy" class="fsel">
+      <option value="cloud" selected>Cloud</option>
+      <option value="self-hosted">Self-hosted</option>
+      <option value="both">Both</option>
+    </select>
+    <select id="sel-license" class="fsel">
+      <option value="ee" selected>EE</option>
+      <option value="community">Community</option>
+    </select>
+  </div>
   <form id="form">
     <span class="prefix">&gt;_</span>
     <textarea id="q" placeholder="Ask your question... (Enter to send)" rows="1"></textarea>
@@ -275,6 +328,9 @@ header{background:var(--emerald);height:48px;padding:0 24px;display:flex;align-i
 var q = document.getElementById('q');
 var form = document.getElementById('form');
 var btn = document.getElementById('btn');
+var selVersion = document.getElementById('sel-version');
+var selDeploy = document.getElementById('sel-deploy');
+var selLicense = document.getElementById('sel-license');
 var msgs = document.getElementById('messages');
 var chatHistory = [];
 
@@ -307,6 +363,26 @@ function inlineMd(t) {
 
 function isFence(l) { return l.length >= 3 && l.charCodeAt(0) === 96 && l.charCodeAt(1) === 96 && l.charCodeAt(2) === 96; }
 
+function parseTable(tableLines) {
+  if (!tableLines.length) return '';
+  function cells(line) { return line.replace(/^\||\|$/g,'').split('|').map(function(c){return c.trim();}); }
+  function isSep(line) { return /^\|[\s\-:|]+\|[\s\-:|]*$/.test(line.trim()); }
+  var hasSep = tableLines.length > 1 && isSep(tableLines[1]);
+  var h = '<div class="tbl-wrap"><table>';
+  if (hasSep) {
+    h += '<thead><tr>';
+    cells(tableLines[0]).forEach(function(c){h+='<th>'+inlineMd(c)+'</th>';});
+    h += '</tr></thead><tbody>';
+    for (var j=2;j<tableLines.length;j++){h+='<tr>';cells(tableLines[j]).forEach(function(c){h+='<td>'+inlineMd(c)+'</td>';});h+='</tr>';}
+    h += '</tbody>';
+  } else {
+    h += '<tbody>';
+    tableLines.forEach(function(line){h+='<tr>';cells(line).forEach(function(c){h+='<td>'+inlineMd(c)+'</td>';});h+='</tr>';});
+    h += '</tbody>';
+  }
+  return h + '</table></div>';
+}
+
 function renderMd(raw) {
   var lines = raw.split('\n'), out = '', i = 0;
   while (i < lines.length) {
@@ -330,6 +406,11 @@ function renderMd(raw) {
       out += '<ol>';
       while (i < lines.length && /^\d+\. /.test(lines[i])) { out += '<li>' + inlineMd(lines[i].replace(/^\d+\. /,'')) + '</li>'; i++; }
       out += '</ol>'; continue;
+    }
+    if (l.trimStart().startsWith('|')) {
+      var tbl = [];
+      while (i < lines.length && lines[i].trimStart().startsWith('|')) { tbl.push(lines[i]); i++; }
+      out += parseTable(tbl); continue;
     }
     if (l.trim() === '') { out += '<br>'; i++; continue; }
     out += '<p>' + inlineMd(l) + '</p>';
@@ -412,7 +493,7 @@ form.addEventListener('submit', async function(e) {
     var res = await fetch('/api/ask', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question: question, top_k: 15, history: chatHistory})
+      body: JSON.stringify({question: question, top_k: 15, history: chatHistory, version: selVersion.value, deployment: selDeploy.value, license: selLicense.value})
     });
     var reader = res.body.getReader();
     var dec = new TextDecoder();

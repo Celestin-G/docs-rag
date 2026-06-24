@@ -46,7 +46,7 @@ func runAsk(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "Searching top %d chunks...\n", topK)
-	chunks, err := st.Search(ctx, vec, topK, 0)
+	chunks, err := st.Search(ctx, vec, topK, 0, store.SearchFilter{License: "ee", Deployment: "both"})
 	if err != nil {
 		return fmt.Errorf("search: %w", err)
 	}
@@ -68,5 +68,5 @@ func runAsk(cmd *cobra.Command, args []string) error {
 	}
 
 	claude := llm.New()
-	return claude.Ask(ctx, question, nil, ctxChunks, os.Stdout)
+	return claude.Ask(ctx, question, nil, ctxChunks, llm.FilterContext{License: "ee", Deployment: "both"}, os.Stdout)
 }

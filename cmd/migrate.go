@@ -20,6 +20,9 @@ CREATE TABLE doc_chunks (
   section     TEXT,
   content     TEXT NOT NULL,
   embedding   vector(768),
+  badge       TEXT,
+  version_num SMALLINT,
+  deployment  TEXT NOT NULL DEFAULT 'both',
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 

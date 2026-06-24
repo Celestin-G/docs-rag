@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -15,6 +16,10 @@ var (
 	jsxTagRe       = regexp.MustCompile(`</?[A-Z][A-Za-z.]*(?:\s[^>]*)?>`)
 	divTagRe       = regexp.MustCompile(`</?div(?:\s[^>]*)?>`)
 	multiBlankRe   = regexp.MustCompile(`\n{3,}`)
+
+	// Frontmatter metadata extraction.
+	badgeRe      = regexp.MustCompile(`(?m)^badge:\s*(\S+)`)
+	versionMinRe = regexp.MustCompile(`min:\s*"v?(\d+)\.(\d+)`)
 )
 
 // stripMDX removes JSX/MDX components while preserving useful text content.
@@ -100,13 +105,47 @@ const maxChunkBytes = 2000
 
 // Chunk represents a parsed documentation section with its metadata.
 type Chunk struct {
-	SourceFile string
-	Section    string
-	Content    string
+	SourceFile  string
+	Section     string
+	Content     string
+	Badge       string // "enterprise" or ""
+	VersionNum  int16  // 0=no constraint, 30=v3.0, 31=v3.1, 32=v3.2, 33=v3.3
+	Deployment  string // "cloud", "self-hosted", or "both"
+}
+
+// parseMeta extracts badge, version, and deployment from frontmatter + file path.
+func parseMeta(relPath string, raw []byte) (badge string, versionNum int16, deployment string) {
+	deployment = "both"
+	if strings.Contains(relPath, "deploy/cloud/") {
+		deployment = "cloud"
+	} else if strings.Contains(relPath, "deploy/self-hosted/") {
+		deployment = "self-hosted"
+	}
+
+	// Extract frontmatter block only.
+	if !bytes.HasPrefix(raw, []byte("---")) {
+		return
+	}
+	idx := bytes.Index(raw[3:], []byte("\n---"))
+	if idx < 0 {
+		return
+	}
+	fm := string(raw[3 : 3+idx])
+
+	if m := badgeRe.FindStringSubmatch(fm); len(m) > 1 {
+		badge = strings.TrimSpace(m[1])
+	}
+	if m := versionMinRe.FindStringSubmatch(fm); len(m) > 2 {
+		major, _ := strconv.Atoi(m[1])
+		minor, _ := strconv.Atoi(m[2])
+		versionNum = int16(major*10 + minor)
+	}
+	return
 }
 
 // ParseFile parses a markdown or MDX file and returns chunks split by H2/H3 headings.
 func ParseFile(relPath string, content []byte) []Chunk {
+	badge, versionNum, deployment := parseMeta(relPath, content)
 	content = stripFrontmatter(content)
 	content = stripMDX(content)
 	sections := splitBySections(content)
@@ -118,16 +157,17 @@ func ParseFile(relPath string, content []byte) []Chunk {
 			continue
 		}
 		for _, part := range splitBySize(text, maxChunkBytes) {
-			// Prefix the section heading into the content so the embedding
-			// captures the topic label, not just the body text.
-			content := part
+			body := part
 			if s.heading != "" {
-				content = s.heading + "\n\n" + part
+				body = s.heading + "\n\n" + part
 			}
 			chunks = append(chunks, Chunk{
 				SourceFile: relPath,
 				Section:    s.heading,
-				Content:    content,
+				Content:    body,
+				Badge:      badge,
+				VersionNum: versionNum,
+				Deployment: deployment,
 			})
 		}
 	}
