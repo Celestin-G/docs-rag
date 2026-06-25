@@ -134,13 +134,13 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fetch more candidates than needed, then apply a diversity filter so no
-	// single file monopolises the context window (e.g. a long file whose
-	// "writes" section ranks 1st doesn't crowd out its own "reads" section).
-	rawChunks, err := s.store.Search(ctx, vec, req.TopK*2, 0.38, filter)
+	// single file monopolises the context window.
+	rawChunks, err := s.store.Search(ctx, vec, queryEn, req.TopK*2, 0.25, filter)
 	if err != nil {
 		send(sseEvent{Type: "error", Text: "Search failed: " + err.Error()})
 		return
 	}
+
 	seenFile := map[string]int{}
 	var chunks []store.DocChunk
 	for _, c := range rawChunks {

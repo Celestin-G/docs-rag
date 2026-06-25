@@ -20,6 +20,7 @@ var (
 	// Frontmatter metadata extraction.
 	badgeRe      = regexp.MustCompile(`(?m)^badge:\s*(\S+)`)
 	versionMinRe = regexp.MustCompile(`min:\s*"v?(\d+)\.(\d+)`)
+	pageTitleRe  = regexp.MustCompile(`(?m)^title:\s*(.+)$`)
 )
 
 // stripMDX removes JSX/MDX components while preserving useful text content.
@@ -113,8 +114,8 @@ type Chunk struct {
 	Deployment  string // "cloud", "self-hosted", or "both"
 }
 
-// parseMeta extracts badge, version, and deployment from frontmatter + file path.
-func parseMeta(relPath string, raw []byte) (badge string, versionNum int16, deployment string) {
+// parseMeta extracts badge, version, deployment, and page title from frontmatter + file path.
+func parseMeta(relPath string, raw []byte) (badge string, versionNum int16, deployment string, pageTitle string) {
 	deployment = "both"
 	if strings.Contains(relPath, "deploy/cloud/") {
 		deployment = "cloud"
@@ -140,12 +141,15 @@ func parseMeta(relPath string, raw []byte) (badge string, versionNum int16, depl
 		minor, _ := strconv.Atoi(m[2])
 		versionNum = int16(major*10 + minor)
 	}
+	if m := pageTitleRe.FindStringSubmatch(fm); len(m) > 1 {
+		pageTitle = strings.Trim(strings.TrimSpace(m[1]), `"'`)
+	}
 	return
 }
 
 // ParseFile parses a markdown or MDX file and returns chunks split by H2/H3 headings.
 func ParseFile(relPath string, content []byte) []Chunk {
-	badge, versionNum, deployment := parseMeta(relPath, content)
+	badge, versionNum, deployment, pageTitle := parseMeta(relPath, content)
 	content = stripFrontmatter(content)
 	content = stripMDX(content)
 	sections := splitBySections(content)
@@ -157,9 +161,19 @@ func ParseFile(relPath string, content []byte) []Chunk {
 			continue
 		}
 		for _, part := range splitBySize(text, maxChunkBytes) {
+			// Build a full breadcrumb prefix: "Page Title > H2 > H3\n\nContent"
+			var prefix string
+			switch {
+			case pageTitle != "" && s.heading != "":
+				prefix = pageTitle + " > " + s.heading
+			case pageTitle != "":
+				prefix = pageTitle
+			case s.heading != "":
+				prefix = s.heading
+			}
 			body := part
-			if s.heading != "" {
-				body = s.heading + "\n\n" + part
+			if prefix != "" {
+				body = prefix + "\n\n" + part
 			}
 			chunks = append(chunks, Chunk{
 				SourceFile: relPath,

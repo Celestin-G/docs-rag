@@ -46,7 +46,7 @@ func runAsk(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "Searching top %d chunks...\n", topK)
-	chunks, err := st.Search(ctx, vec, topK, 0, store.SearchFilter{License: "ee", Deployment: "both"})
+	chunks, err := st.Search(ctx, vec, question, topK, 0, store.SearchFilter{License: "ee", Deployment: "both"})
 	if err != nil {
 		return fmt.Errorf("search: %w", err)
 	}

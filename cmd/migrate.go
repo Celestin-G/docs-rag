@@ -20,6 +20,7 @@ CREATE TABLE doc_chunks (
   section     TEXT,
   content     TEXT NOT NULL,
   embedding   vector(768),
+  content_tsv TSVECTOR,
   badge       TEXT,
   version_num SMALLINT,
   deployment  TEXT NOT NULL DEFAULT 'both',
@@ -28,6 +29,9 @@ CREATE TABLE doc_chunks (
 
 CREATE INDEX doc_chunks_embedding_idx
   ON doc_chunks USING hnsw (embedding vector_cosine_ops);
+
+CREATE INDEX doc_chunks_tsv_idx
+  ON doc_chunks USING GIN(content_tsv);
 `
 
 var migrateCmd = &cobra.Command{

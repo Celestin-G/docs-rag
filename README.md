@@ -7,14 +7,16 @@ A local RAG (Retrieval-Augmented Generation) engine for the [Formance](https://f
 ## How it works
 
 ```
-Question → embed (nomic-embed-text) → pgvector similarity search → top chunks → qwen2.5:32b → streamed answer
+Question → translate EN → embed → hybrid search (vector + BM25) → diversity filter → top chunks → qwen2.5:32b → streamed answer
 ```
 
-1. **Ingest** — the Formance docs repo is walked, `.md`/`.mdx` files are parsed, MDX/JSX noise is stripped, and the text is split into ~500-token chunks by heading hierarchy (H2 → H3).
-2. **Embed** — each chunk is embedded via Ollama (`nomic-embed-text`, 768 dims) and stored in PostgreSQL with a pgvector HNSW index.
-3. **Search** — at query time, the question is embedded and the top-k most similar chunks are retrieved (cosine similarity, diversity filter: max 2 chunks per source file).
-4. **Generate** — the retrieved chunks are injected into the system prompt of `qwen2.5:32b` via Ollama. The model answers strictly from the docs for technical facts, and may synthesise step-by-step guidance from documented concepts.
-5. **Stream** — the answer is streamed token by token to the web UI via SSE.
+1. **Ingest** — the Formance docs repo is walked, `.md`/`.mdx` files are parsed, MDX/JSX noise is stripped, and the text is split into ~500-token chunks by heading hierarchy (H2 → H3). Each chunk is prefixed with a **full breadcrumb** (`Page Title > H2 > H3`) so the embedding model captures the page context.
+2. **Embed** — each chunk is embedded via Ollama (`nomic-embed-text`, 768 dims) and stored in PostgreSQL alongside a `tsvector` column (for full-text search) with a pgvector HNSW index and a GIN index.
+3. **Translate** — at query time the question is translated to English (the language of the docs) before embedding, so French or other-language questions match correctly.
+4. **Hybrid search** — retrieval combines **vector similarity** (70%) and **BM25 keyword matching** (30%) in a single SQL query. This means exact technical terms (`ErrMetadataOverride`, `fctl ledger send`, `unbounded`) are found reliably even when semantic similarity alone would miss them.
+5. **Diversity filter** — the candidate pool (top-k×2) is deduplicated so no single source file contributes more than 2 chunks to the final context.
+6. **Generate** — the retrieved chunks are injected into the system prompt of `qwen2.5:32b` via Ollama. The model answers strictly from the docs for technical facts, and may synthesise step-by-step guidance from documented concepts. Active filters (version, deployment, license) are also injected so the LLM knows what scope it is operating in.
+7. **Stream** — the answer is streamed token by token to the web UI via SSE.
 
 ---
 
@@ -60,7 +62,7 @@ This starts a `pgvector/pgvector:pg17` container on port 5432 with credentials `
 # Embedding model (fast, ~270 MB)
 ollama pull nomic-embed-text
 
-# Generation model (slow to pull, ~20 GB — grab a coffee)
+# Generation + translation model (slow to pull, ~20 GB — grab a coffee)
 ollama pull qwen2.5:32b
 ```
 
@@ -142,16 +144,16 @@ go run . ask "question"   Ask a question from the terminal (no UI)
 
 ```
 cmd/
-  migrate.go   DB schema setup
+  migrate.go   DB schema setup (pgvector + tsvector + GIN index)
   ingest.go    Documentation ingestion pipeline
   serve.go     HTTP server entry point
   ask.go       Terminal Q&A mode
 internal/
-  chunker/     MDX stripping, heading-aware chunking, H2>H3 breadcrumbs
+  chunker/     MDX stripping, heading-aware chunking, page-title breadcrumbs
   embedder/    Ollama nomic-embed-text client
-  llm/         Ollama qwen2.5:32b streaming client + system prompt
+  llm/         Ollama qwen2.5:32b streaming client + translate + system prompt
   server/      HTTP handlers, SSE streaming, embedded web UI
-  store/       pgvector insert / cosine search
+  store/       pgvector hybrid search (vector + BM25), insert, filters
 docker-compose.yml   PostgreSQL + pgvector
 ```
 
@@ -160,6 +162,7 @@ docker-compose.yml   PostgreSQL + pgvector
 ## Stack
 
 - **Go** — single binary, no runtime dependencies
-- **Ollama** — `nomic-embed-text` (embeddings) + `qwen2.5:32b` (generation)
-- **PostgreSQL 17 + pgvector** — HNSW index, cosine similarity search
+- **Ollama** — `nomic-embed-text` (embeddings) + `qwen2.5:32b` (generation + translation)
+- **PostgreSQL 17 + pgvector** — HNSW index for vector search, GIN index for BM25 full-text search
+- **Hybrid retrieval** — 70% vector similarity + 30% BM25 keyword score, combined in a single SQL query
 - **Vanilla JS** — embedded web UI, no build step, SSE streaming

@@ -54,8 +54,10 @@ func (s *Store) Insert(ctx context.Context, chunk DocChunk, badge string, versio
 		vn = versionNum
 	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO doc_chunks (source_file, section, content, embedding, badge, version_num, deployment)
-		 VALUES ($1, $2, $3, $4::vector, $5, $6, $7)`,
+		`INSERT INTO doc_chunks (source_file, section, content, embedding, content_tsv, badge, version_num, deployment)
+		 VALUES ($1, $2, $3, $4::vector,
+		         to_tsvector('english', coalesce($2, '') || ' ' || $3),
+		         $5, $6, $7)`,
 		chunk.SourceFile,
 		chunk.Section,
 		chunk.Content,
@@ -70,9 +72,19 @@ func (s *Store) Insert(ctx context.Context, chunk DocChunk, badge string, versio
 	return nil
 }
 
-// Search retrieves the top-k most similar chunks to the given embedding using cosine similarity.
-// Only chunks with similarity >= minScore are returned (pass 0 to disable filtering).
-func (s *Store) Search(ctx context.Context, embedding []float32, topK int, minScore float32, f SearchFilter) ([]DocChunk, error) {
+// Search retrieves the top-k most similar chunks using vector similarity.
+// When textQuery is non-empty, combines vector score (70%) with BM25 (30%) for hybrid retrieval.
+// Only chunks with score >= minScore are returned (pass 0 to disable filtering).
+func (s *Store) Search(ctx context.Context, embedding []float32, textQuery string, topK int, minScore float32, f SearchFilter) ([]DocChunk, error) {
+	vec := pgvector.NewVector(embedding).String()
+
+	if textQuery == "" {
+		return s.searchVector(ctx, vec, topK, minScore, f)
+	}
+	return s.searchHybrid(ctx, vec, textQuery, topK, minScore, f)
+}
+
+func (s *Store) searchVector(ctx context.Context, vec string, topK int, minScore float32, f SearchFilter) ([]DocChunk, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT source_file, section, content, 1 - (embedding <=> $1::vector) AS score
 		 FROM doc_chunks
@@ -82,17 +94,41 @@ func (s *Store) Search(ctx context.Context, embedding []float32, topK int, minSc
 		   AND ($4::smallint = 0 OR version_num IS NULL OR version_num <= $4::smallint)
 		 ORDER BY embedding <=> $1::vector
 		 LIMIT $5`,
-		pgvector.NewVector(embedding).String(),
-		f.Deployment,
-		f.License,
-		f.VersionNum,
-		topK,
+		vec, f.Deployment, f.License, f.VersionNum, topK,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)
 	}
 	defer rows.Close()
+	return scanChunks(rows, minScore)
+}
 
+func (s *Store) searchHybrid(ctx context.Context, vec string, textQuery string, topK int, minScore float32, f SearchFilter) ([]DocChunk, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT source_file, section, content,
+		        (1 - (embedding <=> $1::vector)) * 0.7 +
+		        ts_rank(content_tsv, plainto_tsquery('english', $2)) * 0.3 AS score
+		 FROM doc_chunks
+		 WHERE
+		   ($3::text = 'both' OR deployment = 'both' OR deployment = $3::text)
+		   AND ($4::text = 'ee' OR badge IS NULL OR badge != 'enterprise')
+		   AND ($5::smallint = 0 OR version_num IS NULL OR version_num <= $5::smallint)
+		 ORDER BY score DESC
+		 LIMIT $6`,
+		vec, textQuery, f.Deployment, f.License, f.VersionNum, topK,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search: %w", err)
+	}
+	defer rows.Close()
+	return scanChunks(rows, minScore)
+}
+
+func scanChunks(rows interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+}, minScore float32) ([]DocChunk, error) {
 	var results []DocChunk
 	for rows.Next() {
 		var c DocChunk

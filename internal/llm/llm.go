@@ -216,3 +216,4 @@ func buildSystem(chunks []ContextChunk, filter FilterContext) string {
 	sb.WriteString("=== FIN DE LA DOCUMENTATION ===")
 	return sb.String()
 }
+
