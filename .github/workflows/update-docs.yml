@@ -1,0 +1,32 @@
+name: Update documentation index
+
+on:
+  schedule:
+    # Every day at 08:00 UTC
+    - cron: '0 8 * * *'
+  workflow_dispatch: # Allow manual trigger from the GitHub UI
+
+jobs:
+  update:
+    name: Pull latest docs and re-ingest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: SSH into server and update index
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key:      ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            set -e
+
+            echo "==> Pulling latest Formance docs..."
+            git -C "$DOCS_PATH" pull --ff-only
+
+            echo "==> Re-ingesting into pgvector..."
+            cd /opt/docs-rag
+            DATABASE_URL="$DATABASE_URL" DOCS_PATH="$DOCS_PATH" go run . ingest --clean
+
+            echo "==> Done."
+          envs: DATABASE_URL,DOCS_PATH

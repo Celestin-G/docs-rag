@@ -32,6 +32,24 @@ CREATE INDEX doc_chunks_embedding_idx
 
 CREATE INDEX doc_chunks_tsv_idx
   ON doc_chunks USING GIN(content_tsv);
+
+-- Feedback and analytics tables survive re-migration (IF NOT EXISTS).
+CREATE TABLE IF NOT EXISTS feedback (
+  id         SERIAL PRIMARY KEY,
+  question   TEXT NOT NULL,
+  answer     TEXT NOT NULL,
+  rating     SMALLINT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS request_logs (
+  id           SERIAL PRIMARY KEY,
+  question     TEXT NOT NULL,
+  duration_ms  INTEGER NOT NULL,
+  chunks_found INTEGER NOT NULL,
+  status       TEXT NOT NULL,
+  created_at   TIMESTAMPTZ DEFAULT NOW()
+);
 `
 
 var migrateCmd = &cobra.Command{

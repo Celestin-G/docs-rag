@@ -143,6 +143,60 @@ func scanChunks(rows interface {
 	return results, rows.Err()
 }
 
+// InsertFeedback stores a user thumbs-up/down on an answer.
+func (s *Store) InsertFeedback(ctx context.Context, question, answer string, rating int) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO feedback (question, answer, rating) VALUES ($1, $2, $3)`,
+		question, answer, rating)
+	return err
+}
+
+// InsertRequestLog records timing and outcome for a single /api/ask call.
+func (s *Store) InsertRequestLog(ctx context.Context, question string, durationMs, chunksFound int, status string) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO request_logs (question, duration_ms, chunks_found, status) VALUES ($1, $2, $3, $4)`,
+		question, durationMs, chunksFound, status)
+	return err
+}
+
+// Stats holds aggregated analytics data.
+type Stats struct {
+	TotalRequests int     `json:"total_requests"`
+	RequestsToday int     `json:"requests_today"`
+	AvgDurationMs float64 `json:"avg_duration_ms"`
+	ErrorRate     float64 `json:"error_rate"`
+	TotalFeedback int     `json:"total_feedback"`
+	PositiveRate  float64 `json:"positive_rate"`
+}
+
+// GetStats returns aggregated request and feedback statistics.
+func (s *Store) GetStats(ctx context.Context) (Stats, error) {
+	var st Stats
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+		  COUNT(*)                                                          AS total_requests,
+		  COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE)               AS requests_today,
+		  COALESCE(AVG(duration_ms), 0)                                    AS avg_duration_ms,
+		  COALESCE(COUNT(*) FILTER (WHERE status = 'error')::float /
+		           NULLIF(COUNT(*), 0), 0)                                 AS error_rate
+		FROM request_logs
+	`).Scan(&st.TotalRequests, &st.RequestsToday, &st.AvgDurationMs, &st.ErrorRate)
+	if err != nil {
+		return st, fmt.Errorf("stats requests: %w", err)
+	}
+	err = s.pool.QueryRow(ctx, `
+		SELECT
+		  COUNT(*)                                                        AS total_feedback,
+		  COALESCE(COUNT(*) FILTER (WHERE rating = 1)::float /
+		           NULLIF(COUNT(*), 0), 0)                               AS positive_rate
+		FROM feedback
+	`).Scan(&st.TotalFeedback, &st.PositiveRate)
+	if err != nil {
+		return st, fmt.Errorf("stats feedback: %w", err)
+	}
+	return st, nil
+}
+
 // Truncate removes all chunks from the table.
 func (s *Store) Truncate(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, "TRUNCATE doc_chunks")

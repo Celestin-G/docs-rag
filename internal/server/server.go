@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -43,6 +44,9 @@ func New(st *store.Store, emb *embedder.Embedder, lm *llm.Client) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.handleIndex)
 	mux.HandleFunc("POST /api/ask", s.withRateLimit(s.handleAsk))
+	mux.HandleFunc("POST /api/feedback", s.handleFeedback)
+	mux.HandleFunc("GET /api/stats", s.handleStatsJSON)
+	mux.HandleFunc("GET /stats", s.handleStatsPage)
 	return mux
 }
 
@@ -158,6 +162,17 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 		req.TopK = 15
 	}
 
+	// Analytics: track timing and outcome for every request.
+	start := time.Now()
+	reqStatus := "ok"
+	chunksFound := 0
+	defer func() {
+		go s.store.InsertRequestLog(
+			context.Background(), req.Question,
+			int(time.Since(start).Milliseconds()), chunksFound, reqStatus,
+		)
+	}()
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -214,6 +229,7 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 	// single file monopolises the context window.
 	rawChunks, err := s.store.Search(ctx, vec, queryEn, req.TopK*2, 0.25, filter)
 	if err != nil {
+		reqStatus = "error"
 		send(sseEvent{Type: "error", Text: "Search failed: " + err.Error()})
 		return
 	}
@@ -230,10 +246,12 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	chunksFound = len(chunks)
 	for _, c := range chunks {
 		log.Printf("retrieval score=%.3f  section=%-30s  file=%s", c.Score, c.Section, c.SourceFile)
 	}
 	if len(chunks) == 0 {
+		reqStatus = "no_results"
 		send(sseEvent{Type: "chunk", Text: "No relevant passage found in the documentation."})
 		send(sseEvent{Type: "done"})
 		return
@@ -246,6 +264,7 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 
 	filterCtx := llm.FilterContext{License: req.License, Deployment: req.Deployment, Version: req.Version}
 	if err := s.llm.Ask(ctx, queryEn, req.History, ctxChunks, filterCtx, &sseWriter{w: w, flusher: flusher}); err != nil {
+		reqStatus = "error"
 		send(sseEvent{Type: "error", Text: "LLM error: " + err.Error()})
 		return
 	}
@@ -257,6 +276,93 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 	send(sseEvent{Type: "sources", Sources: sources})
 	send(sseEvent{Type: "done"})
 }
+
+// --- Feedback -----------------------------------------------------------------
+
+type feedbackReq struct {
+	Question string `json:"question"`
+	Answer   string `json:"answer"`
+	Rating   int    `json:"rating"` // 1 = thumbs up, -1 = thumbs down
+}
+
+func (s *srv) handleFeedback(w http.ResponseWriter, r *http.Request) {
+	var req feedbackReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Rating == 0 {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := s.store.InsertFeedback(r.Context(), req.Question, req.Answer, req.Rating); err != nil {
+		log.Printf("feedback insert: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- Stats --------------------------------------------------------------------
+
+func (s *srv) handleStatsJSON(w http.ResponseWriter, r *http.Request) {
+	st, err := s.store.GetStats(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(st)
+}
+
+func (s *srv) handleStatsPage(w http.ResponseWriter, r *http.Request) {
+	st, err := s.store.GetStats(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	positiveStr := "—"
+	if st.TotalFeedback > 0 {
+		positiveStr = fmt.Sprintf("%.1f%%", st.PositiveRate*100)
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, statsPageHTML,
+		st.TotalRequests, st.RequestsToday,
+		int(st.AvgDurationMs), st.ErrorRate*100,
+		st.TotalFeedback, positiveStr,
+	)
+}
+
+const statsPageHTML = `<!DOCTYPE html>
+<html lang="fr"><head>
+<meta charset="UTF-8">
+<title>Stats — Formance Docs RAG</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'SF Mono','Fira Code',monospace;background:#01353C;color:#BAEABC;padding:48px 32px;min-height:100vh}
+h1{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#7A9396;margin-bottom:32px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;max-width:680px}
+.card{background:#0d4046;border:1px solid #486568;border-radius:3px;padding:20px 24px}
+.card-title{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#7A9396;margin-bottom:16px}
+.stat{display:flex;justify-content:space-between;align-items:baseline;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.06)}
+.stat:last-child{border-bottom:none}
+.stat-label{font-size:12px;color:#D5E1E1}
+.stat-value{font-size:20px;font-weight:700;color:#BAEABC;letter-spacing:-.02em}
+.stat-value small{font-size:11px;font-weight:400;color:#7A9396;margin-left:4px}
+</style>
+</head><body>
+<h1>_stats/ Formance Docs RAG</h1>
+<div class="grid">
+  <div class="card">
+    <div class="card-title">Requetes</div>
+    <div class="stat"><span class="stat-label">Total</span><span class="stat-value">%d</span></div>
+    <div class="stat"><span class="stat-label">Aujourd'hui</span><span class="stat-value">%d</span></div>
+    <div class="stat"><span class="stat-label">Duree moyenne</span><span class="stat-value">%d<small>ms</small></span></div>
+    <div class="stat"><span class="stat-label">Taux d'erreur</span><span class="stat-value">%.1f<small>%%</small></span></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Feedback</div>
+    <div class="stat"><span class="stat-label">Total feedbacks</span><span class="stat-value">%d</span></div>
+    <div class="stat"><span class="stat-label">Reponses positives</span><span class="stat-value">%s</span></div>
+  </div>
+</div>
+</body></html>`
 
 // --- Embedded UI --------------------------------------------------------------
 
@@ -337,6 +443,13 @@ header{background:var(--emerald);height:48px;padding:0 24px;display:flex;align-i
 .sources{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .chip{font-family:var(--mono);font-size:11px;background:var(--emerald);color:var(--mint);padding:3px 10px;border-radius:2px;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default;letter-spacing:.02em;transition:background .12s}
 .chip:hover{background:var(--emerald-10)}
+
+/* Feedback buttons */
+.fb-row{display:flex;align-items:center;gap:8px;margin-top:10px;padding-top:8px;border-top:1px solid var(--slate)}
+.fb-label{font-family:var(--mono);font-size:11px;color:var(--emerald-10)}
+.fb-btn{background:transparent;border:1px solid var(--emerald-20);border-radius:2px;padding:3px 10px;cursor:pointer;font-size:14px;transition:all .12s;line-height:1.4}
+.fb-btn:hover{background:var(--slate-10);border-color:var(--emerald)}
+.fb-thanks{font-family:var(--mono);font-size:11px;color:var(--mint-600)}
 
 /* Input bar */
 #form-wrap{background:var(--slate-10);border-top:1px solid var(--emerald-20);padding:16px 24px;flex-shrink:0;position:relative}
@@ -572,6 +685,12 @@ form.addEventListener('submit', async function(e) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({question: question, top_k: 15, history: chatHistory, version: selVersion.value, deployment: selDeploy.value, license: selLicense.value})
     });
+    if (res.status === 429) {
+      stopThinking();
+      bubble.innerHTML = '<span style="color:#e74c3c">Trop de requêtes — réessaie dans une minute.</span>';
+      btn.disabled = false; btn.textContent = 'Send'; q.focus();
+      return;
+    }
     var reader = res.body.getReader();
     var dec = new TextDecoder();
     var buf = '';
@@ -613,6 +732,22 @@ form.addEventListener('submit', async function(e) {
         } else if (ev.type === 'done') {
           stopThinking();
           bubble.innerHTML = renderMd(text);
+          // Feedback buttons
+          var fbRow = document.createElement('div');
+          fbRow.className = 'fb-row';
+          fbRow.innerHTML = '<span class="fb-label">Cette réponse t\'a aidé ?</span>'
+            + '<button class="fb-btn" data-r="1">👍</button>'
+            + '<button class="fb-btn" data-r="-1">👎</button>';
+          fbRow.querySelectorAll('.fb-btn').forEach(function(fb) {
+            fb.addEventListener('click', function() {
+              fetch('/api/feedback', {method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({question: question, answer: text, rating: parseInt(fb.getAttribute('data-r'))})});
+              fbRow.innerHTML = '<span class="fb-thanks">'
+                + (parseInt(fb.getAttribute('data-r')) === 1 ? 'Merci 😊' : 'Merci, on améliore 📌')
+                + '</span>';
+            });
+          });
+          aDiv.appendChild(fbRow);
 
         } else if (ev.type === 'error') {
           stopThinking();
