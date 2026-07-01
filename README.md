@@ -98,6 +98,28 @@ Then open **http://localhost:8080**.
 
 ---
 
+## Production deployment (nginx)
+
+For a customer-facing deployment, put nginx in front of the Go server. It handles rate limiting at the network edge, before requests reach the app, and passes the real client IP via `X-Real-IP` so the Go-level rate limiter also works correctly.
+
+```bash
+# Copy the provided config
+sudo cp nginx.conf /etc/nginx/sites-available/docs-rag
+sudo ln -s /etc/nginx/sites-available/docs-rag /etc/nginx/sites-enabled/docs-rag
+
+# Test and reload
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Key settings in `nginx.conf`:
+- **Rate limit**: 5 req/min per IP, burst of 3 — applied only on `POST /api/ask`
+- **SSE streaming**: `proxy_buffering off` + `proxy_http_version 1.1` so tokens stream to the browser in real time
+- **Timeout**: `proxy_read_timeout 120s` — LLM generation can take 60s+, don't cut it short
+
+The Go server also enforces the same 5 req/min limit independently (defence in depth). Set your domain in the `server_name` directive.
+
+---
+
 ## Daily use
 
 ```bash

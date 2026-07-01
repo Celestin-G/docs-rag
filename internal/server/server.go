@@ -7,25 +7,102 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/celestingeniaut/docs-rag/internal/embedder"
 	"github.com/celestingeniaut/docs-rag/internal/llm"
 	"github.com/celestingeniaut/docs-rag/internal/store"
+	"golang.org/x/time/rate"
 )
+
+// rateLimit: 5 requests per minute per IP, burst of 3.
+const (
+	ratePerMinute = 5
+	rateBurst     = 3
+	cleanupEvery  = 5 * time.Minute
+	expireAfter   = 10 * time.Minute
+)
+
+type limitEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+type srv struct {
+	store    *store.Store
+	emb      *embedder.Embedder
+	llm      *llm.Client
+	limiters sync.Map // map[string]*limitEntry
+}
 
 // New wires up HTTP handlers and returns a ready handler.
 func New(st *store.Store, emb *embedder.Embedder, lm *llm.Client) http.Handler {
 	s := &srv{store: st, emb: emb, llm: lm}
+	go s.cleanupLimiters()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.handleIndex)
-	mux.HandleFunc("POST /api/ask", s.handleAsk)
+	mux.HandleFunc("POST /api/ask", s.withRateLimit(s.handleAsk))
 	return mux
 }
 
-type srv struct {
-	store *store.Store
-	emb   *embedder.Embedder
-	llm   *llm.Client
+// clientIP extracts the real client IP, honouring X-Forwarded-For when present.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.Index(xff, ","); i >= 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	// Strip port from RemoteAddr.
+	addr := r.RemoteAddr
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		return addr[:i]
+	}
+	return addr
+}
+
+func (s *srv) getLimiter(ip string) *rate.Limiter {
+	now := time.Now()
+	if v, ok := s.limiters.Load(ip); ok {
+		e := v.(*limitEntry)
+		e.lastSeen = now
+		return e.limiter
+	}
+	l := rate.NewLimiter(rate.Every(time.Minute/ratePerMinute), rateBurst)
+	s.limiters.Store(ip, &limitEntry{limiter: l, lastSeen: now})
+	return l
+}
+
+func (s *srv) withRateLimit(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r)
+		if !s.getLimiter(ip).Allow() {
+			log.Printf("rate limit hit: %s", ip)
+			w.Header().Set("Retry-After", "60")
+			http.Error(w, "Too many requests — please wait a moment before asking again.", http.StatusTooManyRequests)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// cleanupLimiters removes stale per-IP entries to prevent unbounded memory growth.
+func (s *srv) cleanupLimiters() {
+	ticker := time.NewTicker(cleanupEvery)
+	defer ticker.Stop()
+	for range ticker.C {
+		cutoff := time.Now().Add(-expireAfter)
+		s.limiters.Range(func(k, v any) bool {
+			if v.(*limitEntry).lastSeen.Before(cutoff) {
+				s.limiters.Delete(k)
+			}
+			return true
+		})
+	}
 }
 
 func (s *srv) handleIndex(w http.ResponseWriter, _ *http.Request) {
