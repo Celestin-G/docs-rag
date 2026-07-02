@@ -10,16 +10,20 @@ jobs:
   update:
     name: Pull latest docs and re-ingest
     runs-on: ubuntu-latest
+    env:
+      SERVER_HOST: ${{ secrets.SERVER_HOST }}
 
     steps:
       # Until the production server exists, SERVER_HOST is unset and the SSH
       # step is skipped — the workflow stays green instead of failing daily.
+      # (The `secrets` context can't be used directly in step `if:` conditions,
+      # so it's mirrored into a job-level env var first.)
       - name: Skip notice (server not configured)
-        if: ${{ secrets.SERVER_HOST == '' }}
+        if: ${{ env.SERVER_HOST == '' }}
         run: echo "SERVER_HOST secret not set — no server deployed yet, skipping docs update."
 
       - name: SSH into server and update index
-        if: ${{ secrets.SERVER_HOST != '' }}
+        if: ${{ env.SERVER_HOST != '' }}
         uses: appleboy/ssh-action@v1.0.3
         with:
           host:     ${{ secrets.SERVER_HOST }}
