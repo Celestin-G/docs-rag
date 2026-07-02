@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	pgvector "github.com/pgvector/pgvector-go"
@@ -141,6 +143,83 @@ func scanChunks(rows interface {
 		results = append(results, c)
 	}
 	return results, rows.Err()
+}
+
+// EnterpriseFeatures returns human-readable names of all enterprise-badged
+// pages currently in the index, derived from their file names. This keeps the
+// EE-feature list in the LLM system prompt in sync with the actual docs.
+func (s *Store) EnterpriseFeatures(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT source_file FROM doc_chunks WHERE badge = 'enterprise' ORDER BY source_file`)
+	if err != nil {
+		return nil, fmt.Errorf("enterprise features: %w", err)
+	}
+	defer rows.Close()
+
+	seen := map[string]bool{}
+	var names []string
+	for rows.Next() {
+		var f string
+		if err := rows.Scan(&f); err != nil {
+			return nil, fmt.Errorf("scan source_file: %w", err)
+		}
+		name := featureName(f)
+		if name != "" && !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names, rows.Err()
+}
+
+// featureName maps an enterprise-badged doc path to a feature name at module
+// granularity, so sub-pages ("wallets/adding-funds.mdx") collapse into their
+// module ("Wallets module") instead of leaking meaningless leaf names like
+// "Send" or "Delay" into the prompt.
+func featureName(path string) string {
+	p := strings.TrimPrefix(path, "apps/docs/content/pages/")
+	segs := strings.Split(p, "/")
+	switch {
+	case len(segs) >= 4 && segs[0] == "modules" && segs[1] == "connectivity" && segs[2] == "connectors":
+		return prettify(stripExt(segs[len(segs)-1])) + " connector"
+	case len(segs) >= 2 && segs[0] == "modules":
+		return prettify(stripExt(segs[1])) + " module"
+	case len(segs) >= 4 && segs[0] == "deploy" && segs[1] == "self-hosted" && segs[2] == "modules":
+		return prettify(stripExt(segs[3])) + " module"
+	default:
+		return prettify(stripExt(segs[len(segs)-1]))
+	}
+}
+
+func stripExt(s string) string {
+	if i := strings.LastIndex(s, "."); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// acronyms are doc-page names that must render fully uppercased.
+var acronyms = map[string]bool{"sso": true, "rbac": true, "api": true, "sdk": true, "mcp": true, "oidc": true}
+
+// prettify title-cases hyphenated names ("audit-logs" → "Audit Logs"),
+// uppercasing known acronyms ("sso" → "SSO").
+func prettify(base string) string {
+	if base == "" {
+		return ""
+	}
+	words := strings.FieldsFunc(base, func(r rune) bool { return r == '-' || r == '_' })
+	for i, w := range words {
+		if w == "" {
+			continue
+		}
+		if acronyms[strings.ToLower(w)] {
+			words[i] = strings.ToUpper(w)
+		} else {
+			words[i] = strings.ToUpper(w[:1]) + w[1:]
+		}
+	}
+	return strings.Join(words, " ")
 }
 
 // InsertFeedback stores a user thumbs-up/down on an answer.

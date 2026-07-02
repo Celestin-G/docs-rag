@@ -30,18 +30,30 @@ func New() *Embedder {
 	return &Embedder{host: host, client: &http.Client{}}
 }
 
-// Embed returns the embedding vector for a single text.
+// nomic-embed-text is trained with task prefixes: queries and documents live
+// in different regions of the embedding space. Using them improves retrieval.
+// See https://huggingface.co/nomic-ai/nomic-embed-text-v1.5#usage
+const (
+	queryPrefix    = "search_query: "
+	documentPrefix = "search_document: "
+)
+
+// Embed returns the embedding vector for a search query (user question).
 func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
-	vecs, err := e.embedMany(ctx, []string{text})
+	vecs, err := e.embedMany(ctx, []string{queryPrefix + text})
 	if err != nil {
 		return nil, err
 	}
 	return vecs[0], nil
 }
 
-// EmbedBatch returns embeddings for multiple texts in a single Ollama call.
+// EmbedBatch returns embeddings for document chunks (ingest side).
 func (e *Embedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
-	return e.embedMany(ctx, texts)
+	prefixed := make([]string, len(texts))
+	for i, t := range texts {
+		prefixed[i] = documentPrefix + t
+	}
+	return e.embedMany(ctx, prefixed)
 }
 
 type embedRequest struct {

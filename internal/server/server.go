@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/celestingeniaut/docs-rag/internal/embedder"
@@ -27,7 +28,7 @@ const (
 
 type limitEntry struct {
 	limiter  *rate.Limiter
-	lastSeen time.Time
+	lastSeen atomic.Int64 // unix nano
 }
 
 type srv struct {
@@ -35,6 +36,29 @@ type srv struct {
 	emb      *embedder.Embedder
 	llm      *llm.Client
 	limiters sync.Map // map[string]*limitEntry
+
+	eeMu        sync.Mutex
+	eeFeatures  []string
+	eeFetchedAt time.Time
+}
+
+// enterpriseFeatures returns the EE feature list for the system prompt,
+// cached for 5 minutes. Returns nil on error — the prompt falls back to its
+// static list, so the guard never disappears.
+func (s *srv) enterpriseFeatures(ctx context.Context) []string {
+	s.eeMu.Lock()
+	defer s.eeMu.Unlock()
+	if time.Since(s.eeFetchedAt) < 5*time.Minute && s.eeFeatures != nil {
+		return s.eeFeatures
+	}
+	feats, err := s.store.EnterpriseFeatures(ctx)
+	if err != nil {
+		log.Printf("enterprise features lookup: %v", err)
+		return s.eeFeatures // possibly stale, better than nothing
+	}
+	s.eeFeatures = feats
+	s.eeFetchedAt = time.Now()
+	return feats
 }
 
 // New wires up HTTP handlers and returns a ready handler.
@@ -44,7 +68,7 @@ func New(st *store.Store, emb *embedder.Embedder, lm *llm.Client) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.handleIndex)
 	mux.HandleFunc("POST /api/ask", s.withRateLimit(s.handleAsk))
-	mux.HandleFunc("POST /api/feedback", s.handleFeedback)
+	mux.HandleFunc("POST /api/feedback", s.withRateLimit(s.handleFeedback))
 	mux.HandleFunc("GET /api/stats", s.handleStatsJSON)
 	mux.HandleFunc("GET /stats", s.handleStatsPage)
 	return mux
@@ -70,15 +94,12 @@ func clientIP(r *http.Request) string {
 }
 
 func (s *srv) getLimiter(ip string) *rate.Limiter {
-	now := time.Now()
-	if v, ok := s.limiters.Load(ip); ok {
-		e := v.(*limitEntry)
-		e.lastSeen = now
-		return e.limiter
+	e := &limitEntry{limiter: rate.NewLimiter(rate.Every(time.Minute/ratePerMinute), rateBurst)}
+	if v, loaded := s.limiters.LoadOrStore(ip, e); loaded {
+		e = v.(*limitEntry)
 	}
-	l := rate.NewLimiter(rate.Every(time.Minute/ratePerMinute), rateBurst)
-	s.limiters.Store(ip, &limitEntry{limiter: l, lastSeen: now})
-	return l
+	e.lastSeen.Store(time.Now().UnixNano())
+	return e.limiter
 }
 
 func (s *srv) withRateLimit(next http.HandlerFunc) http.HandlerFunc {
@@ -99,9 +120,9 @@ func (s *srv) cleanupLimiters() {
 	ticker := time.NewTicker(cleanupEvery)
 	defer ticker.Stop()
 	for range ticker.C {
-		cutoff := time.Now().Add(-expireAfter)
+		cutoff := time.Now().Add(-expireAfter).UnixNano()
 		s.limiters.Range(func(k, v any) bool {
-			if v.(*limitEntry).lastSeen.Before(cutoff) {
+			if v.(*limitEntry).lastSeen.Load() < cutoff {
 				s.limiters.Delete(k)
 			}
 			return true
@@ -152,13 +173,28 @@ func (sw *sseWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// Input caps: protect the embedder, the LLM context window and the DB from abuse.
+const (
+	maxQuestionLen = 2000
+	maxHistoryLen  = 12 // last 6 user/assistant turns
+	maxBodyBytes   = 256 << 10
+)
+
 func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var req askReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Question) == "" {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if req.TopK <= 0 {
+	if len(req.Question) > maxQuestionLen {
+		http.Error(w, "question too long (max 2000 characters)", http.StatusBadRequest)
+		return
+	}
+	if len(req.History) > maxHistoryLen {
+		req.History = req.History[len(req.History)-maxHistoryLen:]
+	}
+	if req.TopK <= 0 || req.TopK > 30 {
 		req.TopK = 15
 	}
 
@@ -167,10 +203,14 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 	reqStatus := "ok"
 	chunksFound := 0
 	defer func() {
-		go s.store.InsertRequestLog(
-			context.Background(), req.Question,
-			int(time.Since(start).Milliseconds()), chunksFound, reqStatus,
-		)
+		go func() {
+			if err := s.store.InsertRequestLog(
+				context.Background(), req.Question,
+				int(time.Since(start).Milliseconds()), chunksFound, reqStatus,
+			); err != nil {
+				log.Printf("request log insert: %v", err)
+			}
+		}()
 	}()
 
 	flusher, ok := w.(http.Flusher)
@@ -263,6 +303,9 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filterCtx := llm.FilterContext{License: req.License, Deployment: req.Deployment, Version: req.Version}
+	if req.License == "community" {
+		filterCtx.EEFeatures = s.enterpriseFeatures(ctx)
+	}
 	if err := s.llm.Ask(ctx, queryEn, req.History, ctxChunks, filterCtx, &sseWriter{w: w, flusher: flusher}); err != nil {
 		reqStatus = "error"
 		send(sseEvent{Type: "error", Text: "LLM error: " + err.Error()})
@@ -286,10 +329,17 @@ type feedbackReq struct {
 }
 
 func (s *srv) handleFeedback(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var req feedbackReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Rating == 0 {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || (req.Rating != 1 && req.Rating != -1) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
+	}
+	if len(req.Question) > maxQuestionLen {
+		req.Question = req.Question[:maxQuestionLen]
+	}
+	if len(req.Answer) > 20000 {
+		req.Answer = req.Answer[:20000]
 	}
 	if err := s.store.InsertFeedback(r.Context(), req.Question, req.Answer, req.Rating); err != nil {
 		log.Printf("feedback insert: %v", err)

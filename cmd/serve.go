@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/celestingeniaut/docs-rag/internal/embedder"
 	"github.com/celestingeniaut/docs-rag/internal/llm"
@@ -37,6 +38,14 @@ func runServe(cmd *cobra.Command, _ []string) error {
 
 	handler := server.New(st, embedder.New(), llm.New())
 
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+		// No WriteTimeout: SSE responses legitimately stream for 60s+.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
 	log.Printf("Formance Docs RAG — http://localhost%s\n", addr)
-	return http.ListenAndServe(addr, handler)
+	return srv.ListenAndServe()
 }
