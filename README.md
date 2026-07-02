@@ -11,12 +11,12 @@ Question → translate EN → embed → hybrid search (vector + BM25) → divers
 ```
 
 1. **Ingest** — the Formance docs repo is walked, `.md`/`.mdx` files are parsed, MDX/JSX noise is stripped, and the text is split into ~500-token chunks by heading hierarchy (H2 → H3). Each chunk is prefixed with a **full breadcrumb** (`Page Title > H2 > H3`) so the embedding model captures the page context.
-2. **Embed** — each chunk is embedded via Ollama (`nomic-embed-text`, 768 dims) and stored in PostgreSQL alongside a `tsvector` column (for full-text search) with a pgvector HNSW index and a GIN index.
-3. **Translate** — at query time the question is translated to English (the language of the docs) before embedding, so French or other-language questions match correctly.
+2. **Embed** — each chunk is embedded via Ollama (`nomic-embed-text`, 768 dims) using the model's `search_document:` task prefix, and stored in PostgreSQL alongside a `tsvector` column (for full-text search) with a pgvector HNSW index and a GIN index.
+3. **Translate** — at query time the question is translated to English (the language of the docs) before embedding, so French or other-language questions match correctly. The query is embedded with the `search_query:` prefix.
 4. **Hybrid search** — retrieval combines **vector similarity** (70%) and **BM25 keyword matching** (30%) in a single SQL query. This means exact technical terms (`ErrMetadataOverride`, `fctl ledger send`, `unbounded`) are found reliably even when semantic similarity alone would miss them.
 5. **Diversity filter** — the candidate pool (top-k×2) is deduplicated so no single source file contributes more than 2 chunks to the final context.
-6. **Generate** — the retrieved chunks are injected into the system prompt of `qwen2.5:32b` via Ollama. The model answers strictly from the docs for technical facts, and may synthesise step-by-step guidance from documented concepts. Active filters (version, deployment, license) are also injected so the LLM knows what scope it is operating in.
-7. **Stream** — the answer is streamed token by token to the web UI via SSE.
+6. **Generate** — the retrieved chunks are injected into the system prompt of `qwen2.5:32b` via Ollama (temperature 0.2 for factual answers). The model answers strictly from the docs for technical facts, and may synthesise step-by-step guidance from documented concepts. Active filters (version, deployment, license) are also injected so the LLM knows what scope it is operating in. In Community mode, the list of Enterprise-only features is **derived live from the badges in the database** (cached 5 min), so the guard stays in sync with the docs; the model must flag EE features as such, and may offer a clearly-labeled Community alternative when one exists.
+7. **Stream** — the answer is streamed token by token to the web UI via SSE. Each answer gets 👍/👎 feedback buttons, stored for quality monitoring.
 
 ---
 
@@ -98,6 +98,33 @@ Then open **http://localhost:8080**.
 
 ---
 
+## Security
+
+Two independent rate-limiting layers (defence in depth):
+
+- **Go middleware** — 5 req/min per IP (burst 3) on `POST /api/ask` and `POST /api/feedback`, honouring `X-Forwarded-For`/`X-Real-IP` behind a proxy. Stale per-IP entries are garbage-collected automatically. Exceeding the limit returns `429` with a friendly message in the UI.
+- **nginx** (production) — same limit enforced at the network edge before requests reach the app (see below).
+
+Input hardening on `/api/ask`: request body capped at 256 KB, question at 2 000 characters, history at the last 12 turns, `top_k` at 30. The system prompt also instructs the model to treat the user question as data, not instructions (prompt-injection mitigation).
+
+---
+
+## Feedback & analytics
+
+- **👍/👎 buttons** under every answer — stored in the `feedback` table with the question and answer.
+- **Request logging** — every `/api/ask` call is recorded (duration, chunks found, status: `ok` / `error` / `no_results`).
+- **`GET /stats`** — monitoring dashboard in the browser: total & today's requests, average duration, error rate, feedback volume and positive rate. Also available as raw JSON at `GET /api/stats`.
+
+Both tables are created with `IF NOT EXISTS` and survive `migrate` runs (only `doc_chunks` is dropped and rebuilt).
+
+---
+
+## Automated docs updates (GitHub Action)
+
+`.github/workflows/update-docs.yml` runs **every day at 08:00 UTC** (and on manual trigger): it SSHes into the server, pulls the latest Formance docs, and re-ingests the index. Configure these repository secrets once the server exists: `SERVER_HOST`, `SERVER_USER`, `SERVER_SSH_KEY`, `DATABASE_URL`, `DOCS_PATH`.
+
+---
+
 ## Production deployment (nginx)
 
 For a customer-facing deployment, put nginx in front of the Go server. It handles rate limiting at the network edge, before requests reach the app, and passes the real client IP via `X-Real-IP` so the Go-level rate limiter also works correctly.
@@ -133,9 +160,10 @@ That's it. The index persists in PostgreSQL — no need to re-ingest unless the 
 ```bash
 cd ~/formance-docs && git pull
 cd ~/docs-rag
-go run . migrate   # drops and recreates the table
-go run . ingest    # re-embeds everything
+go run . ingest --clean   # re-embeds everything (no migrate needed unless the schema changed)
 ```
+
+This is exactly what the GitHub Action does automatically every day at 08:00 UTC.
 
 ---
 
@@ -166,16 +194,19 @@ go run . ask "question"   Ask a question from the terminal (no UI)
 
 ```
 cmd/
-  migrate.go   DB schema setup (pgvector + tsvector + GIN index)
+  migrate.go   DB schema setup (pgvector + tsvector + GIN index + feedback/analytics tables)
   ingest.go    Documentation ingestion pipeline
-  serve.go     HTTP server entry point
+  serve.go     HTTP server entry point (with timeouts)
   ask.go       Terminal Q&A mode
 internal/
   chunker/     MDX stripping, heading-aware chunking, page-title breadcrumbs
-  embedder/    Ollama nomic-embed-text client
-  llm/         Ollama qwen2.5:32b streaming client + translate + system prompt
-  server/      HTTP handlers, SSE streaming, embedded web UI
-  store/       pgvector hybrid search (vector + BM25), insert, filters
+  embedder/    Ollama nomic-embed-text client (search_query:/search_document: prefixes)
+  llm/         Ollama qwen2.5:32b streaming client + translate + hardened system prompt
+  server/      HTTP handlers, SSE streaming, rate limiting, feedback, stats, embedded web UI
+  store/       pgvector hybrid search (vector + BM25), filters, feedback, analytics, EE features
+.github/workflows/
+  update-docs.yml    Daily automated docs re-ingestion (08:00 UTC)
+nginx.conf           Production reverse proxy (rate limit, SSE, timeouts)
 docker-compose.yml   PostgreSQL + pgvector
 ```
 
@@ -184,7 +215,8 @@ docker-compose.yml   PostgreSQL + pgvector
 ## Stack
 
 - **Go** — single binary, no runtime dependencies
-- **Ollama** — `nomic-embed-text` (embeddings) + `qwen2.5:32b` (generation + translation)
-- **PostgreSQL 17 + pgvector** — HNSW index for vector search, GIN index for BM25 full-text search
+- **Ollama** — `nomic-embed-text` (embeddings, task prefixes) + `qwen2.5:32b` (generation at temp 0.2 + translation)
+- **PostgreSQL 17 + pgvector** — HNSW index for vector search, GIN index for BM25 full-text search; also stores feedback and request analytics
 - **Hybrid retrieval** — 70% vector similarity + 30% BM25 keyword score, combined in a single SQL query
 - **Vanilla JS** — embedded web UI, no build step, SSE streaming
+- **nginx + GitHub Actions** — production edge (rate limit, SSE passthrough) and daily automated index updates
