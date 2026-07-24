@@ -13,21 +13,28 @@ import (
 )
 
 const defaultHost = "http://localhost:11434"
-const model = "qwen2.5:32b"
+const defaultModel = "qwen2.5:32b"
 
 // Client calls the Ollama /api/chat endpoint with streaming.
 type Client struct {
 	host   string
+	model  string
 	client *http.Client
 }
 
-// New creates a Client. Reads OLLAMA_HOST from the environment (default: http://localhost:11434).
+// New creates a Client. Reads OLLAMA_HOST (default: http://localhost:11434) and
+// OLLAMA_MODEL (default: qwen2.5:32b) from the environment — this lets ops swap
+// to a smaller model on resource-constrained clusters without a code change.
 func New() *Client {
 	host := os.Getenv("OLLAMA_HOST")
 	if host == "" {
 		host = defaultHost
 	}
-	return &Client{host: host, client: &http.Client{}}
+	model := os.Getenv("OLLAMA_MODEL")
+	if model == "" {
+		model = defaultModel
+	}
+	return &Client{host: host, model: model, client: &http.Client{}}
 }
 
 // ContextChunk is a retrieved doc chunk used as RAG context.
@@ -79,7 +86,7 @@ func (c *Client) Translate(ctx context.Context, text string) (string, error) {
 		},
 		{Role: "user", Content: text},
 	}
-	body, err := json.Marshal(chatRequest{Model: model, Messages: messages, Stream: false, Options: chatOptions{Temperature: 0.1}})
+	body, err := json.Marshal(chatRequest{Model: c.model, Messages: messages, Stream: false, Options: chatOptions{Temperature: 0.1}})
 	if err != nil {
 		return text, err
 	}
@@ -124,7 +131,7 @@ func (c *Client) Ask(ctx context.Context, question string, history []Message, ch
 	// Current question
 	messages = append(messages, Message{Role: "user", Content: question})
 
-	body, err := json.Marshal(chatRequest{Model: model, Messages: messages, Stream: true, Options: chatOptions{Temperature: 0.2}})
+	body, err := json.Marshal(chatRequest{Model: c.model, Messages: messages, Stream: true, Options: chatOptions{Temperature: 0.2}})
 	if err != nil {
 		return err
 	}
