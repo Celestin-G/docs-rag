@@ -12,29 +12,55 @@ import (
 	"strings"
 )
 
-const defaultHost = "http://localhost:11434"
+// Defaults target a local Ollama, which also speaks the OpenAI-compatible
+// /v1/chat/completions API — so the same client works for both local Ollama
+// dev and a hosted OpenAI-compatible gateway (LiteLLM) in prod.
+const defaultBaseURL = "http://localhost:11434/v1"
 const defaultModel = "qwen2.5:32b"
 
-// Client calls the Ollama /api/chat endpoint with streaming.
+// Client calls an OpenAI-compatible /chat/completions endpoint with streaming.
 type Client struct {
-	host   string
-	model  string
-	client *http.Client
+	baseURL string
+	apiKey  string
+	model   string
+	client  *http.Client
 }
 
-// New creates a Client. Reads OLLAMA_HOST (default: http://localhost:11434) and
-// OLLAMA_MODEL (default: qwen2.5:32b) from the environment — this lets ops swap
-// to a smaller model on resource-constrained clusters without a code change.
+// New creates a Client from the environment:
+//   - LLM_BASE_URL : OpenAI-compatible base, incl. /v1 (default local Ollama)
+//   - LLM_API_KEY  : Bearer token (LiteLLM key); empty for keyless Ollama
+//   - LLM_MODEL    : model id, e.g. "claude-opus-5" (prod) or "qwen2.5:32b" (local)
+//
+// Swapping provider/model is pure config — no code change.
 func New() *Client {
-	host := os.Getenv("OLLAMA_HOST")
-	if host == "" {
-		host = defaultHost
+	base := os.Getenv("LLM_BASE_URL")
+	if base == "" {
+		base = defaultBaseURL
 	}
-	model := os.Getenv("OLLAMA_MODEL")
+	base = strings.TrimRight(base, "/")
+	model := os.Getenv("LLM_MODEL")
 	if model == "" {
 		model = defaultModel
 	}
-	return &Client{host: host, model: model, client: &http.Client{}}
+	return &Client{
+		baseURL: base,
+		apiKey:  os.Getenv("LLM_API_KEY"),
+		model:   model,
+		client:  &http.Client{},
+	}
+}
+
+// newChatRequest builds a POST to {baseURL}/chat/completions with auth.
+func (c *Client) newChatRequest(ctx context.Context, body []byte) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	return req, nil
 }
 
 // ContextChunk is a retrieved doc chunk used as RAG context.
@@ -59,21 +85,28 @@ type Message struct {
 }
 
 type chatRequest struct {
-	Model    string      `json:"model"`
-	Messages []Message   `json:"messages"`
-	Stream   bool        `json:"stream"`
-	Options  chatOptions `json:"options"`
-}
-
-// chatOptions tunes Ollama sampling. Low temperature keeps factual RAG answers
-// close to the source material instead of paraphrasing loosely.
-type chatOptions struct {
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+	Stream   bool      `json:"stream"`
+	// Low temperature keeps factual RAG answers close to the source material
+	// instead of paraphrasing loosely. Top-level field, per the OpenAI API.
 	Temperature float64 `json:"temperature"`
 }
 
-type chatChunk struct {
-	Message Message `json:"message"`
-	Done    bool    `json:"done"`
+// streamChunk is one OpenAI-style SSE delta: {"choices":[{"delta":{"content":"…"}}]}.
+type streamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
+
+// chatResponse is a non-streamed OpenAI completion: {"choices":[{"message":{…}}]}.
+type chatResponse struct {
+	Choices []struct {
+		Message Message `json:"message"`
+	} `json:"choices"`
 }
 
 // Translate translates text to English. Returns the original text unchanged if
@@ -86,15 +119,14 @@ func (c *Client) Translate(ctx context.Context, text string) (string, error) {
 		},
 		{Role: "user", Content: text},
 	}
-	body, err := json.Marshal(chatRequest{Model: c.model, Messages: messages, Stream: false, Options: chatOptions{Temperature: 0.1}})
+	body, err := json.Marshal(chatRequest{Model: c.model, Messages: messages, Stream: false, Temperature: 0.1})
 	if err != nil {
 		return text, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.host+"/api/chat", bytes.NewReader(body))
+	req, err := c.newChatRequest(ctx, body)
 	if err != nil {
 		return text, err
 	}
-	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -102,14 +134,14 @@ func (c *Client) Translate(ctx context.Context, text string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	var result struct {
-		Message Message `json:"message"`
-	}
+	var result chatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return text, err
 	}
-	if t := strings.TrimSpace(result.Message.Content); t != "" {
-		return t, nil
+	if len(result.Choices) > 0 {
+		if t := strings.TrimSpace(result.Choices[0].Message.Content); t != "" {
+			return t, nil
+		}
 	}
 	return text, nil
 }
@@ -131,40 +163,46 @@ func (c *Client) Ask(ctx context.Context, question string, history []Message, ch
 	// Current question
 	messages = append(messages, Message{Role: "user", Content: question})
 
-	body, err := json.Marshal(chatRequest{Model: c.model, Messages: messages, Stream: true, Options: chatOptions{Temperature: 0.2}})
+	body, err := json.Marshal(chatRequest{Model: c.model, Messages: messages, Stream: true, Temperature: 0.2})
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.host+"/api/chat", bytes.NewReader(body))
+	req, err := c.newChatRequest(ctx, body)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("ollama chat: %w", err)
+		return fmt.Errorf("llm chat: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ollama chat: HTTP %d", resp.StatusCode)
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("llm chat: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 
+	// OpenAI-style SSE: each event is a `data: {json}` line; the stream ends
+	// with `data: [DONE]`. Lines can be long, so give the scanner a big buffer.
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		var chunk chatChunk
-		if err := json.Unmarshal(line, &chunk); err != nil {
-			continue
-		}
-		fmt.Fprint(out, chunk.Message.Content)
-		if chunk.Done {
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
 			break
+		}
+		var chunk streamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if len(chunk.Choices) > 0 {
+			fmt.Fprint(out, chunk.Choices[0].Delta.Content)
 		}
 	}
 	fmt.Fprintln(out)

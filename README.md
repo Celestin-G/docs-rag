@@ -192,7 +192,12 @@ go run . ask "question"   Ask a question from the terminal (no UI)
 |----------|----------|---------|-------------|
 | `DATABASE_URL` | yes | — | PostgreSQL DSN |
 | `DOCS_PATH` | yes (ingest) | — | Path to the cloned formance docs repo |
-| `OLLAMA_HOST` | no | `http://localhost:11434` | Ollama API base URL |
+| `OLLAMA_HOST` | no | `http://localhost:11434` | Ollama API base URL — used for **embeddings** (`nomic-embed-text`) |
+| `LLM_BASE_URL` | no | `http://localhost:11434/v1` | OpenAI-compatible base URL for **generation** (incl. `/v1`). Local Ollama by default; set to a LiteLLM gateway in prod |
+| `LLM_API_KEY` | no | — | Bearer token for `LLM_BASE_URL` (e.g. a LiteLLM key). Leave empty for keyless local Ollama |
+| `LLM_MODEL` | no | `qwen2.5:32b` | Generation model id — e.g. `qwen2.5:32b` (local) or `claude-opus-5` (LiteLLM) |
+
+> **Generation is OpenAI-compatible.** The same client talks to local Ollama (`/v1/chat/completions`) or a hosted LiteLLM gateway — switching provider/model is pure config (`LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL`), no code change. Embeddings stay on Ollama's `nomic-embed-text` regardless.
 
 ---
 
