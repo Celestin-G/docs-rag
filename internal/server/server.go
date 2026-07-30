@@ -527,9 +527,9 @@ header{background:var(--emerald);height:48px;padding:0 24px;display:flex;align-i
 
 <div id="messages">
   <div id="empty">
-    <div class="e-eyebrow">_rag/</div>
-    <h2 class="e-heading">Ask a question about the Formance platform.</h2>
-    <p class="e-sub">Vector search across the official documentation.<br>Answers generated locally by Ollama.</p>
+    <div class="e-eyebrow">_proof-of-concept/</div>
+    <h2 class="e-heading">A RAG assistant over Formance's internal documentation.</h2>
+    <p class="e-sub">Proof of concept — for internal use today, intended to later serve customers publicly.<br>Ask a question about the platform to get a sourced answer.</p>
     <div class="suggestions">
       <div class="sug" onclick="fill('What is Numscript?')">What is Numscript?</div>
       <div class="sug" onclick="fill('How does the Ledger module work?')">How does the Ledger work?</div>
