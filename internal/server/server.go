@@ -306,7 +306,10 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 	if req.License == "community" {
 		filterCtx.EEFeatures = s.enterpriseFeatures(ctx)
 	}
-	if err := s.llm.Ask(ctx, queryEn, req.History, ctxChunks, filterCtx, &sseWriter{w: w, flusher: flusher}); err != nil {
+	// Generate from the ORIGINAL question (not the English translation): the
+	// translation is only for retrieval (matching the English docs). Passing the
+	// user's own wording makes the model answer in the user's language.
+	if err := s.llm.Ask(ctx, req.Question, req.History, ctxChunks, filterCtx, &sseWriter{w: w, flusher: flusher}); err != nil {
 		reqStatus = "error"
 		send(sseEvent{Type: "error", Text: "LLM error: " + err.Error()})
 		return
