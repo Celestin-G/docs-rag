@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,6 +70,14 @@ func New(st *store.Store, emb *embedder.Embedder, lm *llm.Client) http.Handler {
 	mux.HandleFunc("POST /api/feedback", s.withRateLimit(s.handleFeedback))
 	mux.HandleFunc("GET /api/stats", s.handleStatsJSON)
 	mux.HandleFunc("GET /stats", s.handleStatsPage)
+	// MCP endpoint for agents. The streamable HTTP transport uses POST for calls,
+	// GET for the server-to-client stream and DELETE to end a session. Each method
+	// is registered on its own: a method-less "/api/mcp" pattern conflicts with
+	// "GET /" above, and ServeMux panics rather than pick a winner.
+	mcpHandler := s.mcpHandler()
+	mux.Handle("POST /api/mcp", mcpHandler)
+	mux.Handle("GET /api/mcp", mcpHandler)
+	mux.Handle("DELETE /api/mcp", mcpHandler)
 	return mux
 }
 
@@ -191,12 +198,7 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "question too long (max 2000 characters)", http.StatusBadRequest)
 		return
 	}
-	if len(req.History) > maxHistoryLen {
-		req.History = req.History[len(req.History)-maxHistoryLen:]
-	}
-	if req.TopK <= 0 || req.TopK > 30 {
-		req.TopK = 15
-	}
+	req.normalise()
 
 	// Analytics: track timing and outcome for every request.
 	start := time.Now()
@@ -232,94 +234,21 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	// Translate to English before embedding so the query matches the English docs.
-	queryEn, err := s.llm.Translate(ctx, req.Question)
+	// Shared with the MCP tool — see (*srv).answer.
+	res, err := s.answer(ctx, req, &sseWriter{w: w, flusher: flusher})
+	chunksFound = len(res.Sources)
+	reqStatus = res.Status
 	if err != nil {
-		queryEn = req.Question // graceful fallback
-	}
-
-	vec, err := s.emb.Embed(ctx, queryEn)
-	if err != nil {
-		send(sseEvent{Type: "error", Text: "Embedding failed: " + err.Error()})
+		send(sseEvent{Type: "error", Text: err.Error()})
 		return
 	}
-
-	// Build search filter from request parameters.
-	filter := store.SearchFilter{
-		License:    req.License,
-		Deployment: req.Deployment,
-	}
-	if filter.License == "" {
-		filter.License = "ee"
-	}
-	if filter.Deployment == "" {
-		filter.Deployment = "both"
-	}
-	if req.Version != "" {
-		// "3.2" → 32, "3.0" → 30, etc.
-		parts := strings.SplitN(req.Version, ".", 2)
-		if len(parts) == 2 {
-			major, _ := strconv.Atoi(parts[0])
-			minor, _ := strconv.Atoi(parts[1])
-			filter.VersionNum = int16(major*10 + minor)
-		}
-	}
-
-	// Fetch more candidates than needed, then apply a diversity filter so no
-	// single file monopolises the context window.
-	rawChunks, err := s.store.Search(ctx, vec, queryEn, req.TopK*2, 0.25, filter)
-	if err != nil {
-		reqStatus = "error"
-		send(sseEvent{Type: "error", Text: "Search failed: " + err.Error()})
-		return
-	}
-
-	seenFile := map[string]int{}
-	var chunks []store.DocChunk
-	for _, c := range rawChunks {
-		if seenFile[c.SourceFile] >= 2 {
-			continue
-		}
-		seenFile[c.SourceFile]++
-		chunks = append(chunks, c)
-		if len(chunks) >= req.TopK {
-			break
-		}
-	}
-	chunksFound = len(chunks)
-	for _, c := range chunks {
-		log.Printf("retrieval score=%.3f  section=%-30s  file=%s", c.Score, c.Section, c.SourceFile)
-	}
-	if len(chunks) == 0 {
-		reqStatus = "no_results"
-		send(sseEvent{Type: "chunk", Text: "No relevant passage found in the documentation."})
+	if res.Status == "no_results" {
+		send(sseEvent{Type: "chunk", Text: noResultsMessage})
 		send(sseEvent{Type: "done"})
 		return
 	}
 
-	ctxChunks := make([]llm.ContextChunk, len(chunks))
-	for i, c := range chunks {
-		ctxChunks[i] = llm.ContextChunk{SourceFile: c.SourceFile, Section: c.Section, Content: c.Content}
-	}
-
-	filterCtx := llm.FilterContext{License: req.License, Deployment: req.Deployment, Version: req.Version}
-	if req.License == "community" {
-		filterCtx.EEFeatures = s.enterpriseFeatures(ctx)
-	}
-	// Generate from the ORIGINAL question (not the English translation): the
-	// translation is only for retrieval (matching the English docs). Passing the
-	// user's own wording makes the model answer in the user's language.
-	if err := s.llm.Ask(ctx, req.Question, req.History, ctxChunks, filterCtx, &sseWriter{w: w, flusher: flusher}); err != nil {
-		reqStatus = "error"
-		send(sseEvent{Type: "error", Text: "LLM error: " + err.Error()})
-		return
-	}
-
-	sources := make([]source, len(chunks))
-	for i, c := range chunks {
-		sources[i] = source{File: c.SourceFile, Section: c.Section}
-	}
-	send(sseEvent{Type: "sources", Sources: sources})
+	send(sseEvent{Type: "sources", Sources: res.Sources})
 	send(sseEvent{Type: "done"})
 }
 
