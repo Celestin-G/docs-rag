@@ -112,7 +112,7 @@ func (s *srv) answer(ctx context.Context, req askReq, out io.Writer) (answerResu
 	}
 
 	// Build search filter from request parameters.
-	filter := store.SearchFilter{License: req.License, Deployment: req.Deployment}
+	filter := store.SearchFilter{License: req.License, Deployment: req.Deployment, Dimensions: req.dimensions()}
 	if filter.License == "" {
 		filter.License = "ee"
 	}

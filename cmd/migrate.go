@@ -38,6 +38,12 @@ CREATE TABLE doc_chunks (
   -- the user selects; the rest are stored for the per-component cascade, which
   -- needs the framework's composition graph to be machine-readable first.
   version_component TEXT NOT NULL DEFAULT 'stack',
+  -- Which dimension values the page applies to, e.g. {"numscript": ["new"]}.
+  -- This is how the docs hide experimental features: a page carrying
+  -- visibility.numscript = new does not exist when the Legacy Machine is
+  -- selected. Distinct from the version bounds above — a page can be gated on a
+  -- dimension without any version constraint, and the reverse.
+  visibility JSONB,
   deployment  TEXT NOT NULL DEFAULT 'both',
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );

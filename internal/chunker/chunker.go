@@ -24,6 +24,12 @@ var (
 	// A page may scope its version constraint to a component other than the
 	// stack, e.g. `component: numscript-interpreter` with `version: {min: "0.0.15"}`.
 	componentRe = regexp.MustCompile(`(?m)^component:\s*(\S+)`)
+	// Pages declare which dimension values they apply to, e.g.
+	// `visibility: { numscript: "new" }` — the page exists only when the New
+	// Interpreter is selected. This is how the site hides experimental features,
+	// and it is a different mechanism from the version bounds above.
+	visibilityRe = regexp.MustCompile(`(?m)^visibility:\s*\{([^}]*)\}`)
+	visEntryRe   = regexp.MustCompile(`([A-Za-z0-9_-]+)\s*:\s*(\[[^\]]*\]|"[^"]*"|'[^']*'|[^,\s]+)`)
 )
 
 // stripMDX removes JSX/MDX components while preserving useful text content.
@@ -124,6 +130,11 @@ type Chunk struct {
 	// own scale and must not be compared against a stack version.
 	VersionComponent string
 	Deployment       string // "cloud", "self-hosted", or "both"
+	// Visibility maps a dimension id to the values the page applies to, e.g.
+	// {"numscript": ["new"]}. A dimension absent from the map is unconstrained.
+	// Values are always normalised to a slice, even when the frontmatter gives a
+	// single string, so consumers never have to handle both shapes.
+	Visibility map[string][]string
 }
 
 // pageMeta is what a page's frontmatter and path say about it.
@@ -133,6 +144,7 @@ type pageMeta struct {
 	component  string // what versionNum is measured against; "stack" by default
 	deployment string
 	pageTitle  string
+	visibility map[string][]string
 }
 
 // parseMeta extracts metadata from frontmatter and file path.
@@ -171,7 +183,41 @@ func parseMeta(relPath string, raw []byte) pageMeta {
 	if g := pageTitleRe.FindStringSubmatch(fm); len(g) > 1 {
 		m.pageTitle = strings.Trim(strings.TrimSpace(g[1]), `"'`)
 	}
+	if g := visibilityRe.FindStringSubmatch(fm); len(g) > 1 {
+		m.visibility = parseVisibility(g[1])
+	}
 	return m
+}
+
+// parseVisibility reads the body of a `visibility: { ... }` frontmatter entry.
+//
+// Values come as a bare word, a quoted string or a list — "new", 'new' and
+// ["new", "legacy"] all appear — and are normalised to a slice so the rest of
+// the pipeline sees one shape. Written as a small scanner rather than a YAML
+// dependency: the frontmatter is a fixed inline form, and a parse failure here
+// should drop the constraint (page stays visible) rather than drop the page.
+func parseVisibility(body string) map[string][]string {
+	out := map[string][]string{}
+	for _, g := range visEntryRe.FindAllStringSubmatch(body, -1) {
+		key, raw := g[1], strings.TrimSpace(g[2])
+		var values []string
+		if strings.HasPrefix(raw, "[") {
+			for _, item := range strings.Split(strings.Trim(raw, "[]"), ",") {
+				if v := strings.Trim(strings.TrimSpace(item), `"'`); v != "" {
+					values = append(values, v)
+				}
+			}
+		} else if v := strings.Trim(raw, `"'`); v != "" {
+			values = []string{v}
+		}
+		if len(values) > 0 {
+			out[key] = values
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // ParseFile parses a markdown or MDX file and returns chunks split by H2/H3 headings.
@@ -211,6 +257,7 @@ func ParseFile(relPath string, content []byte) []Chunk {
 				VersionNum:       meta.versionNum,
 				VersionComponent: meta.component,
 				Deployment:       meta.deployment,
+				Visibility:       meta.visibility,
 			})
 		}
 	}

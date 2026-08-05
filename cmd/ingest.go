@@ -111,7 +111,7 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 				Section:    c.Section,
 				Content:    c.Content,
 				Embedding:  embeddings[j],
-			}, c.Badge, c.VersionNum, c.VersionBelow, c.VersionComponent, c.Deployment); err != nil {
+			}, c.Badge, c.VersionNum, c.VersionBelow, c.VersionComponent, c.Deployment, c.Visibility); err != nil {
 				return fmt.Errorf("insert chunk from %s: %w", relPath, err)
 			}
 		}

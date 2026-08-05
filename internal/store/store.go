@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -53,12 +54,18 @@ type SearchFilter struct {
 	// 30/31/32/33. A chunk is eligible when this version falls inside its
 	// [version_num, version_below) range.
 	VersionNum int16
+	// Dimensions is the selected value per docs dimension, e.g.
+	// {"numscript": "new", "sdk": "go"}. A chunk is excluded when it declares a
+	// constraint on a dimension present here and the selected value is not among
+	// the values it allows. Dimensions absent from this map filter nothing, so an
+	// unspecified dimension widens the answer rather than emptying it.
+	Dimensions map[string]string
 }
 
 // Insert stores a single chunk in the database. versionNum is the lower version
 // bound and versionBelow the exclusive upper bound; pass 0 for either to mean
 // unbounded on that side.
-func (s *Store) Insert(ctx context.Context, chunk DocChunk, badge string, versionNum, versionBelow int16, versionComponent, deployment string) error {
+func (s *Store) Insert(ctx context.Context, chunk DocChunk, badge string, versionNum, versionBelow int16, versionComponent, deployment string, visibility map[string][]string) error {
 	// Zero means "no bound" and must reach SQL as NULL, not as 0: the filters
 	// treat NULL as unbounded but would compare a literal 0.
 	nullIfZero := func(v int16) interface{} {
@@ -67,11 +74,21 @@ func (s *Store) Insert(ctx context.Context, chunk DocChunk, badge string, versio
 		}
 		return nil
 	}
+	// NULL rather than an empty object: the filter treats NULL as unconstrained,
+	// and "{}" would iterate to the same result at a cost on every row.
+	var vis interface{}
+	if len(visibility) > 0 {
+		b, err := json.Marshal(visibility)
+		if err != nil {
+			return fmt.Errorf("marshal visibility: %w", err)
+		}
+		vis = string(b)
+	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO doc_chunks (source_file, section, content, embedding, content_tsv, badge, version_num, version_below, version_component, deployment)
+		`INSERT INTO doc_chunks (source_file, section, content, embedding, content_tsv, badge, version_num, version_below, version_component, deployment, visibility)
 		 VALUES ($1, $2, $3, $4::vector,
 		         to_tsvector('english', coalesce($2, '') || ' ' || $3),
-		         $5, $6, $7, $8, $9)`,
+		         $5, $6, $7, $8, $9, $10)`,
 		chunk.SourceFile,
 		chunk.Section,
 		chunk.Content,
@@ -81,11 +98,26 @@ func (s *Store) Insert(ctx context.Context, chunk DocChunk, badge string, versio
 		nullIfZero(versionBelow),
 		versionComponent,
 		deployment,
+		vis,
 	)
 	if err != nil {
 		return fmt.Errorf("insert chunk: %w", err)
 	}
 	return nil
+}
+
+// dimsJSON renders the selected dimensions for the SQL predicate. An empty
+// selection becomes "{}", which matches no dimension key and therefore filters
+// nothing.
+func dimsJSON(d map[string]string) string {
+	if len(d) == 0 {
+		return "{}"
+	}
+	b, err := json.Marshal(d)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
 
 // Search retrieves the top-k most similar chunks using vector similarity.
@@ -110,9 +142,12 @@ func (s *Store) searchVector(ctx context.Context, vec string, topK int, minScore
 		   AND ($4::smallint = 0 OR version_component <> 'stack' OR (
 		         (version_num IS NULL OR version_num <= $4::smallint)
 		         AND (version_below IS NULL OR $4::smallint < version_below)))
+		   AND NOT EXISTS (
+		     SELECT 1 FROM jsonb_each(doc_chunks.visibility) AS v(dim, allowed)
+		     WHERE $5::jsonb ? v.dim AND NOT (allowed ? ($5::jsonb ->> v.dim)))
 		 ORDER BY embedding <=> $1::vector
-		 LIMIT $5`,
-		vec, f.Deployment, f.License, f.VersionNum, topK,
+		 LIMIT $6`,
+		vec, f.Deployment, f.License, f.VersionNum, dimsJSON(f.Dimensions), topK,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)
@@ -133,9 +168,12 @@ func (s *Store) searchHybrid(ctx context.Context, vec string, textQuery string, 
 		   AND ($5::smallint = 0 OR version_component <> 'stack' OR (
 		         (version_num IS NULL OR version_num <= $5::smallint)
 		         AND (version_below IS NULL OR $5::smallint < version_below)))
+		   AND NOT EXISTS (
+		     SELECT 1 FROM jsonb_each(doc_chunks.visibility) AS v(dim, allowed)
+		     WHERE $6::jsonb ? v.dim AND NOT (allowed ? ($6::jsonb ->> v.dim)))
 		 ORDER BY score DESC
-		 LIMIT $6`,
-		vec, textQuery, f.Deployment, f.License, f.VersionNum, topK,
+		 LIMIT $7`,
+		vec, textQuery, f.Deployment, f.License, f.VersionNum, dimsJSON(f.Dimensions), topK,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)

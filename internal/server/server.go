@@ -183,9 +183,27 @@ type askReq struct {
 	Question   string        `json:"question"`
 	TopK       int           `json:"top_k"`
 	History    []llm.Message `json:"history"`
-	Version    string        `json:"version"`    // "3.0","3.1","3.2","3.3"
+	Version    string        `json:"version"`    // "3.0","3.1","3.2"
 	Deployment string        `json:"deployment"` // "cloud","self-hosted","both"
 	License    string        `json:"license"`    // "ee","community"
+	// Docs dimensions. Pages declare which values they apply to, so selecting one
+	// hides the pages that do not. Numscript is the one that gates experimental
+	// features; SDK matters because the docs carry per-language variants and
+	// answering a Go question with a TypeScript snippet is worse than useless.
+	Numscript string `json:"numscript"` // "new","legacy"
+	SDK       string `json:"sdk"`       // "typescript","go","python","java","csharp","php"
+}
+
+// dimensions renders the request's dimension selections for the search filter.
+// Empty values are omitted: an unspecified dimension must not filter anything.
+func (r *askReq) dimensions() map[string]string {
+	d := map[string]string{}
+	for k, v := range map[string]string{"numscript": r.Numscript, "sdk": r.SDK} {
+		if v != "" {
+			d[k] = v
+		}
+	}
+	return d
 }
 
 type sseEvent struct {
@@ -486,7 +504,7 @@ a.chip:hover{text-decoration:underline}
 .fsel{height:44px;font-family:var(--mono);font-size:11px;color:var(--emerald);background:#fff;border:1px solid var(--emerald-20);border-right:none;padding:0 20px 0 10px;cursor:pointer;outline:none;letter-spacing:.02em;-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='4' viewBox='0 0 8 4'%3E%3Cpath d='M0 0l4 4 4-4z' fill='%231a3a2a' opacity='.3'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 6px center;transition:border-color .12s;box-sizing:border-box}
 .fsel:hover,.fsel:focus{border-color:var(--emerald)}
 #sel-version{border-radius:2px 0 0 2px}
-#sel-license{border-right:1px solid var(--emerald-20);border-radius:0 2px 2px 0}
+#sel-sdk{border-right:1px solid var(--emerald-20);border-radius:0 2px 2px 0}
 .prefix{font-family:var(--mono);font-size:14px;color:var(--gold);background:var(--emerald);padding:10px 12px;border-radius:2px 0 0 2px;display:flex;align-items:center;flex-shrink:0;user-select:none;border:1px solid var(--emerald);border-right:none}
 #q{flex:1;padding:10px 14px;border:1px solid var(--emerald-20);border-left:none;border-right:none;background:#fff;font-size:14px;font-family:var(--mono);resize:none;min-height:44px;max-height:160px;outline:none;line-height:1.5;color:var(--emerald);border-radius:0;transition:border-color .12s}
 #q::placeholder{color:var(--emerald-20)}
@@ -527,6 +545,19 @@ a.chip:hover{text-decoration:underline}
       <option value="self-hosted">Self-hosted</option>
       <option value="both">Both</option>
     </select>
+    <select id="sel-numscript" class="fsel" title="Numscript interpreter">
+      <option value="new" selected>New interpreter</option>
+      <option value="legacy">Legacy machine</option>
+    </select>
+    <select id="sel-sdk" class="fsel" title="SDK">
+      <option value="">Any SDK</option>
+      <option value="typescript">TypeScript</option>
+      <option value="go">Go</option>
+      <option value="python">Python</option>
+      <option value="java">Java</option>
+      <option value="csharp">C# / .NET</option>
+      <option value="php">PHP</option>
+    </select>
     <select id="sel-license" class="fsel">
       <option value="ee" selected>EE</option>
       <option value="community">Community</option>
@@ -546,6 +577,8 @@ var btn = document.getElementById('btn');
 var selVersion = document.getElementById('sel-version');
 var selDeploy = document.getElementById('sel-deploy');
 var selLicense = document.getElementById('sel-license');
+var selNumscript = document.getElementById('sel-numscript');
+var selSdk = document.getElementById('sel-sdk');
 var msgs = document.getElementById('messages');
 var chatHistory = [];
 
@@ -708,7 +741,7 @@ form.addEventListener('submit', async function(e) {
     var res = await fetch('/api/ask', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question: question, top_k: 15, history: chatHistory, version: selVersion.value, deployment: selDeploy.value, license: selLicense.value})
+      body: JSON.stringify({question: question, top_k: 15, history: chatHistory, version: selVersion.value, deployment: selDeploy.value, license: selLicense.value, numscript: selNumscript.value, sdk: selSdk.value})
     });
     if (res.status === 429) {
       stopThinking();
