@@ -21,6 +21,9 @@ var (
 	badgeRe      = regexp.MustCompile(`(?m)^badge:\s*(\S+)`)
 	versionMinRe = regexp.MustCompile(`min:\s*"v?(\d+)\.(\d+)`)
 	pageTitleRe  = regexp.MustCompile(`(?m)^title:\s*(.+)$`)
+	// A page may scope its version constraint to a component other than the
+	// stack, e.g. `component: numscript-interpreter` with `version: {min: "0.0.15"}`.
+	componentRe = regexp.MustCompile(`(?m)^component:\s*(\S+)`)
 )
 
 // stripMDX removes JSX/MDX components while preserving useful text content.
@@ -115,45 +118,66 @@ type Chunk struct {
 	// to the latest version. Set from the docs framework's version-composition
 	// ranges; markdown pages carry only a lower bound and leave this at 0.
 	VersionBelow int16
-	Deployment   string // "cloud", "self-hosted", or "both"
+	// VersionComponent names what VersionNum/VersionBelow are measured against:
+	// "stack" by default, or a component id from the page's frontmatter such as
+	// "numscript-interpreter". Bounds on other components are on that component's
+	// own scale and must not be compared against a stack version.
+	VersionComponent string
+	Deployment       string // "cloud", "self-hosted", or "both"
 }
 
-// parseMeta extracts badge, version, deployment, and page title from frontmatter + file path.
-func parseMeta(relPath string, raw []byte) (badge string, versionNum int16, deployment string, pageTitle string) {
-	deployment = "both"
+// pageMeta is what a page's frontmatter and path say about it.
+type pageMeta struct {
+	badge      string
+	versionNum int16
+	component  string // what versionNum is measured against; "stack" by default
+	deployment string
+	pageTitle  string
+}
+
+// parseMeta extracts metadata from frontmatter and file path.
+func parseMeta(relPath string, raw []byte) pageMeta {
+	m := pageMeta{deployment: "both", component: "stack"}
 	if strings.Contains(relPath, "deploy/cloud/") {
-		deployment = "cloud"
+		m.deployment = "cloud"
 	} else if strings.Contains(relPath, "deploy/self-hosted/") {
-		deployment = "self-hosted"
+		m.deployment = "self-hosted"
 	}
 
 	// Extract frontmatter block only.
 	if !bytes.HasPrefix(raw, []byte("---")) {
-		return
+		return m
 	}
 	idx := bytes.Index(raw[3:], []byte("\n---"))
 	if idx < 0 {
-		return
+		return m
 	}
 	fm := string(raw[3 : 3+idx])
 
-	if m := badgeRe.FindStringSubmatch(fm); len(m) > 1 {
-		badge = strings.TrimSpace(m[1])
+	if g := badgeRe.FindStringSubmatch(fm); len(g) > 1 {
+		m.badge = strings.TrimSpace(g[1])
 	}
-	if m := versionMinRe.FindStringSubmatch(fm); len(m) > 2 {
-		major, _ := strconv.Atoi(m[1])
-		minor, _ := strconv.Atoi(m[2])
-		versionNum = int16(major*10 + minor)
+	// Read the component before the version: the bound only means something
+	// relative to it. A page scoped to numscript-interpreter states "0.0.15" on
+	// that component's own scale, which is not comparable to a stack version.
+	if g := componentRe.FindStringSubmatch(fm); len(g) > 1 {
+		m.component = strings.Trim(strings.TrimSpace(g[1]), `"'`)
 	}
-	if m := pageTitleRe.FindStringSubmatch(fm); len(m) > 1 {
-		pageTitle = strings.Trim(strings.TrimSpace(m[1]), `"'`)
+	if g := versionMinRe.FindStringSubmatch(fm); len(g) > 2 {
+		major, _ := strconv.Atoi(g[1])
+		minor, _ := strconv.Atoi(g[2])
+		m.versionNum = int16(major*10 + minor)
 	}
-	return
+	if g := pageTitleRe.FindStringSubmatch(fm); len(g) > 1 {
+		m.pageTitle = strings.Trim(strings.TrimSpace(g[1]), `"'`)
+	}
+	return m
 }
 
 // ParseFile parses a markdown or MDX file and returns chunks split by H2/H3 headings.
 func ParseFile(relPath string, content []byte) []Chunk {
-	badge, versionNum, deployment, pageTitle := parseMeta(relPath, content)
+	meta := parseMeta(relPath, content)
+	pageTitle := meta.pageTitle
 	content = stripFrontmatter(content)
 	content = stripMDX(content)
 	sections := splitBySections(content)
@@ -180,12 +204,13 @@ func ParseFile(relPath string, content []byte) []Chunk {
 				body = prefix + "\n\n" + part
 			}
 			chunks = append(chunks, Chunk{
-				SourceFile: relPath,
-				Section:    s.heading,
-				Content:    body,
-				Badge:      badge,
-				VersionNum: versionNum,
-				Deployment: deployment,
+				SourceFile:       relPath,
+				Section:          s.heading,
+				Content:          body,
+				Badge:            meta.badge,
+				VersionNum:       meta.versionNum,
+				VersionComponent: meta.component,
+				Deployment:       meta.deployment,
 			})
 		}
 	}

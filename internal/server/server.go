@@ -39,6 +39,10 @@ type srv struct {
 	eeMu        sync.Mutex
 	eeFeatures  []string
 	eeFetchedAt time.Time
+
+	verMu        sync.Mutex
+	verOptions   string
+	verFetchedAt time.Time
 }
 
 // enterpriseFeatures returns the EE feature list for the system prompt,
@@ -137,9 +141,40 @@ func (s *srv) cleanupLimiters() {
 	}
 }
 
-func (s *srv) handleIndex(w http.ResponseWriter, _ *http.Request) {
+// versionOptions renders the stack-version picker from the versions actually
+// present in the index, cached for 5 minutes. Falling back to an empty list on
+// error is deliberate: an empty picker means "no version filter", which returns
+// more than intended rather than silently returning nothing.
+func (s *srv) versionOptions(ctx context.Context) string {
+	s.verMu.Lock()
+	defer s.verMu.Unlock()
+	if time.Since(s.verFetchedAt) < 5*time.Minute && s.verOptions != "" {
+		return s.verOptions
+	}
+	versions, err := s.store.StackVersions(ctx)
+	if err != nil {
+		log.Printf("stack versions lookup: %v", err)
+		return s.verOptions // possibly stale, better than nothing
+	}
+
+	var b strings.Builder
+	for i, v := range versions {
+		label := fmt.Sprintf("%d.%d", v/10, v%10)
+		// Default to the newest: the question is almost always about today.
+		sel := ""
+		if i == len(versions)-1 {
+			sel = " selected"
+		}
+		fmt.Fprintf(&b, `<option value="%s"%s>v%s</option>`, label, sel, label)
+	}
+	s.verOptions = b.String()
+	s.verFetchedAt = time.Now()
+	return s.verOptions
+}
+
+func (s *srv) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, ui)
+	fmt.Fprint(w, strings.Replace(ui, "<!--VERSION_OPTIONS-->", s.versionOptions(r.Context()), 1))
 }
 
 // --- /api/ask -----------------------------------------------------------------
@@ -478,10 +513,7 @@ a.chip:hover{text-decoration:underline}
 <div id="form-wrap">
   <div id="fsel-group">
     <select id="sel-version" class="fsel">
-      <option value="3.0">v3.0</option>
-      <option value="3.1">v3.1</option>
-      <option value="3.2" selected>v3.2</option>
-      <option value="3.3">v3.3</option>
+      <!--VERSION_OPTIONS-->
     </select>
     <select id="sel-deploy" class="fsel">
       <option value="cloud" selected>Cloud</option>

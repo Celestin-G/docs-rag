@@ -165,6 +165,14 @@ func (s *srv) answer(ctx context.Context, req askReq, out io.Writer) (answerResu
 	if req.License == "community" {
 		filterCtx.EEFeatures = s.enterpriseFeatures(ctx)
 	}
+	// Warn about experimental features only when one was actually retrieved, so
+	// the rule costs nothing on the vast majority of questions.
+	for _, c := range chunks {
+		if c.Badge == "experimental" {
+			filterCtx.Experimental = true
+			break
+		}
+	}
 	// Generate from the ORIGINAL question (not the English translation): the
 	// translation is only for retrieval (matching the English docs). Passing the
 	// user's own wording makes the model answer in the user's language.

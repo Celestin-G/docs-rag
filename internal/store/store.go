@@ -40,6 +40,9 @@ type DocChunk struct {
 	Content    string
 	Embedding  []float32
 	Score      float32 // cosine similarity [0,1] — only set by Search
+	// Badge is the page's frontmatter badge ("enterprise", "experimental", "")
+	// — only set by Search, so callers can warn about what they are quoting.
+	Badge string
 }
 
 // SearchFilter restricts which chunks are eligible for retrieval.
@@ -55,7 +58,7 @@ type SearchFilter struct {
 // Insert stores a single chunk in the database. versionNum is the lower version
 // bound and versionBelow the exclusive upper bound; pass 0 for either to mean
 // unbounded on that side.
-func (s *Store) Insert(ctx context.Context, chunk DocChunk, badge string, versionNum, versionBelow int16, deployment string) error {
+func (s *Store) Insert(ctx context.Context, chunk DocChunk, badge string, versionNum, versionBelow int16, versionComponent, deployment string) error {
 	// Zero means "no bound" and must reach SQL as NULL, not as 0: the filters
 	// treat NULL as unbounded but would compare a literal 0.
 	nullIfZero := func(v int16) interface{} {
@@ -65,10 +68,10 @@ func (s *Store) Insert(ctx context.Context, chunk DocChunk, badge string, versio
 		return nil
 	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO doc_chunks (source_file, section, content, embedding, content_tsv, badge, version_num, version_below, deployment)
+		`INSERT INTO doc_chunks (source_file, section, content, embedding, content_tsv, badge, version_num, version_below, version_component, deployment)
 		 VALUES ($1, $2, $3, $4::vector,
 		         to_tsvector('english', coalesce($2, '') || ' ' || $3),
-		         $5, $6, $7, $8)`,
+		         $5, $6, $7, $8, $9)`,
 		chunk.SourceFile,
 		chunk.Section,
 		chunk.Content,
@@ -76,6 +79,7 @@ func (s *Store) Insert(ctx context.Context, chunk DocChunk, badge string, versio
 		badge,
 		nullIfZero(versionNum),
 		nullIfZero(versionBelow),
+		versionComponent,
 		deployment,
 	)
 	if err != nil {
@@ -98,13 +102,14 @@ func (s *Store) Search(ctx context.Context, embedding []float32, textQuery strin
 
 func (s *Store) searchVector(ctx context.Context, vec string, topK int, minScore float32, f SearchFilter) ([]DocChunk, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT source_file, section, content, 1 - (embedding <=> $1::vector) AS score
+		`SELECT source_file, section, content, badge, 1 - (embedding <=> $1::vector) AS score
 		 FROM doc_chunks
 		 WHERE
 		   ($2::text = 'both' OR deployment = 'both' OR deployment = $2::text)
 		   AND ($3::text = 'ee' OR badge IS NULL OR badge != 'enterprise')
-		   AND ($4::smallint = 0 OR version_num IS NULL OR version_num <= $4::smallint)
-		   AND ($4::smallint = 0 OR version_below IS NULL OR $4::smallint < version_below)
+		   AND ($4::smallint = 0 OR version_component <> 'stack' OR (
+		         (version_num IS NULL OR version_num <= $4::smallint)
+		         AND (version_below IS NULL OR $4::smallint < version_below)))
 		 ORDER BY embedding <=> $1::vector
 		 LIMIT $5`,
 		vec, f.Deployment, f.License, f.VersionNum, topK,
@@ -118,15 +123,16 @@ func (s *Store) searchVector(ctx context.Context, vec string, topK int, minScore
 
 func (s *Store) searchHybrid(ctx context.Context, vec string, textQuery string, topK int, minScore float32, f SearchFilter) ([]DocChunk, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT source_file, section, content,
+		`SELECT source_file, section, content, badge,
 		        (1 - (embedding <=> $1::vector)) * 0.7 +
 		        ts_rank(content_tsv, plainto_tsquery('english', $2)) * 0.3 AS score
 		 FROM doc_chunks
 		 WHERE
 		   ($3::text = 'both' OR deployment = 'both' OR deployment = $3::text)
 		   AND ($4::text = 'ee' OR badge IS NULL OR badge != 'enterprise')
-		   AND ($5::smallint = 0 OR version_num IS NULL OR version_num <= $5::smallint)
-		   AND ($5::smallint = 0 OR version_below IS NULL OR $5::smallint < version_below)
+		   AND ($5::smallint = 0 OR version_component <> 'stack' OR (
+		         (version_num IS NULL OR version_num <= $5::smallint)
+		         AND (version_below IS NULL OR $5::smallint < version_below)))
 		 ORDER BY score DESC
 		 LIMIT $6`,
 		vec, textQuery, f.Deployment, f.License, f.VersionNum, topK,
@@ -146,8 +152,14 @@ func scanChunks(rows interface {
 	var results []DocChunk
 	for rows.Next() {
 		var c DocChunk
-		if err := rows.Scan(&c.SourceFile, &c.Section, &c.Content, &c.Score); err != nil {
+		// badge is nullable in the table; scan through a pointer so a NULL page
+		// (most of them) leaves the field empty instead of failing the row.
+		var badge *string
+		if err := rows.Scan(&c.SourceFile, &c.Section, &c.Content, &badge, &c.Score); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		if badge != nil {
+			c.Badge = *badge
 		}
 		if minScore > 0 && c.Score < minScore {
 			continue
@@ -155,6 +167,34 @@ func scanChunks(rows interface {
 		results = append(results, c)
 	}
 	return results, rows.Err()
+}
+
+// StackVersions returns the stack versions the index actually carries, as the
+// compact form used in filters (30, 31, 32…), ascending.
+//
+// The picker is built from this rather than from a hardcoded list: the docs
+// framework adds and removes stack lines over time — v3.3 was announced, then
+// cancelled and folded into v3.2 — and a list written into the HTML drifts
+// silently, offering versions that match nothing.
+func (s *Store) StackVersions(ctx context.Context) ([]int16, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT version_num FROM doc_chunks
+		 WHERE version_num IS NOT NULL AND version_component = 'stack'
+		 ORDER BY version_num`)
+	if err != nil {
+		return nil, fmt.Errorf("stack versions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []int16
+	for rows.Next() {
+		var v int16
+		if err := rows.Scan(&v); err != nil {
+			return nil, fmt.Errorf("scan version_num: %w", err)
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
 }
 
 // EnterpriseFeatures returns human-readable names of all enterprise-badged

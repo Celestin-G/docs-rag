@@ -76,6 +76,10 @@ type FilterContext struct {
 	Deployment string   // "cloud", "self-hosted", "both"
 	Version    string   // e.g. "3.2"
 	EEFeatures []string // enterprise-only feature names, derived from DB badges
+	// Experimental is true when at least one retrieved excerpt comes from a page
+	// badged experimental. Those features need opting in at three levels, and an
+	// answer that omits that reads as if they were generally available.
+	Experimental bool
 }
 
 // Message is a single turn in the conversation history.
@@ -236,6 +240,10 @@ func buildSystem(chunks []ContextChunk, filter FilterContext) string {
 		sb.WriteString("  AFTER stating that, you MAY offer a documented Community-edition alternative if one genuinely covers the underlying need (e.g. modeling balances with Ledger accounts instead of the Wallets module) — but only using features present in the documentation excerpts below, and always explicitly labeled as a Community alternative, not as the EE feature itself.\n")
 	} else {
 		sb.WriteString("- License: Enterprise (EE) — all features are available.\n")
+	}
+	if filter.Experimental {
+		sb.WriteString("- Some excerpts below come from pages marked **experimental**.\n")
+		sb.WriteString("  CRITICAL RULE: an experimental Numscript feature is not available by default. If your answer relies on one, say so before showing it, and state all three things needed to use it: `runtime: experimental-interpreter` in the transaction request body (the default is `machine`), the Ledger settings `ledger.experimental-features` and `ledger.experimental-numscript` set to true, and the feature's own `#![feature(...)]` flag. Name the Ledger or Stack version it requires when the excerpts give it. Never present an experimental feature as generally available.\n")
 	}
 	sb.WriteString("\n")
 

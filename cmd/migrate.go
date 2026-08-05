@@ -30,6 +30,14 @@ CREATE TABLE doc_chunks (
   -- question scoped to v3.2.
   version_num   SMALLINT,
   version_below SMALLINT,
+  -- Which component the version bounds are expressed against. Pages declare it
+  -- in frontmatter as "component: numscript-interpreter" and default to the
+  -- stack. Without it a ledger "2.3" constraint reads as stack v2.3 and a
+  -- "0.0.15" interpreter constraint collapses to zero, so both stop filtering
+  -- anything. Only stack-scoped bounds are compared against the stack version
+  -- the user selects; the rest are stored for the per-component cascade, which
+  -- needs the framework's composition graph to be machine-readable first.
+  version_component TEXT NOT NULL DEFAULT 'stack',
   deployment  TEXT NOT NULL DEFAULT 'both',
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );

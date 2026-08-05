@@ -79,7 +79,11 @@ func ParseGeneratedJSON(relPath string, content []byte) []Chunk {
 		// Try the version-composed shape first.
 		var ds vccDataset
 		if err := json.Unmarshal(raw, &ds); err == nil && len(ds.Versions) > 0 {
-			out = append(out, chunksFromVersions(relPath, dataset, ds.Versions)...)
+			component := ds.Component
+			if component == "" {
+				component = "stack"
+			}
+			out = append(out, chunksFromVersions(relPath, dataset, component, ds.Versions)...)
 			continue
 		}
 		// Fall back to a flat map of entries, with no version bounds.
@@ -90,10 +94,11 @@ func ParseGeneratedJSON(relPath string, content []byte) []Chunk {
 		for _, id := range sortedKeys(flat) {
 			if text := renderEntry(dataset, id, flat[id]); text != "" {
 				out = append(out, Chunk{
-					SourceFile: relPath,
-					Section:    sectionLabel(dataset, id),
-					Content:    text,
-					Deployment: "both",
+					SourceFile:       relPath,
+					Section:          sectionLabel(dataset, id),
+					Content:          text,
+					VersionComponent: "stack",
+					Deployment:       "both",
 				})
 			}
 		}
@@ -103,7 +108,7 @@ func ParseGeneratedJSON(relPath string, content []byte) []Chunk {
 
 // chunksFromVersions walks one dataset's version ranges, rendering each entry
 // and coalescing consecutive ranges that produce the same text.
-func chunksFromVersions(relPath, dataset string, versions []vccVersion) []Chunk {
+func chunksFromVersions(relPath, dataset, component string, versions []vccVersion) []Chunk {
 	// Ranges arrive in ascending order in the generated files; sorting by lower
 	// bound makes the coalescing below independent of that assumption.
 	sort.SliceStable(versions, func(i, j int) bool {
@@ -144,12 +149,13 @@ func chunksFromVersions(relPath, dataset string, versions []vccVersion) []Chunk 
 	for _, id := range ids {
 		for _, s := range spans[id] {
 			out = append(out, Chunk{
-				SourceFile:   relPath,
-				Section:      sectionLabel(dataset, id),
-				Content:      s.text,
-				VersionNum:   s.from,
-				VersionBelow: s.below,
-				Deployment:   "both",
+				SourceFile:       relPath,
+				Section:          sectionLabel(dataset, id),
+				Content:          s.text,
+				VersionNum:       s.from,
+				VersionBelow:     s.below,
+				VersionComponent: component,
+				Deployment:       "both",
 			})
 		}
 	}
