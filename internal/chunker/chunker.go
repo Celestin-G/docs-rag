@@ -106,12 +106,16 @@ const maxChunkBytes = 2000
 
 // Chunk represents a parsed documentation section with its metadata.
 type Chunk struct {
-	SourceFile  string
-	Section     string
-	Content     string
-	Badge       string // "enterprise" or ""
-	VersionNum  int16  // 0=no constraint, 30=v3.0, 31=v3.1, 32=v3.2, 33=v3.3
-	Deployment  string // "cloud", "self-hosted", or "both"
+	SourceFile string
+	Section    string
+	Content    string
+	Badge      string // "enterprise" or ""
+	VersionNum int16  // lower bound: 0=unbounded, 30=v3.0, 31=v3.1, 32=v3.2, 33=v3.3
+	// VersionBelow is the exclusive upper bound, 0 when the content still applies
+	// to the latest version. Set from the docs framework's version-composition
+	// ranges; markdown pages carry only a lower bound and leave this at 0.
+	VersionBelow int16
+	Deployment   string // "cloud", "self-hosted", or "both"
 }
 
 // parseMeta extracts badge, version, deployment, and page title from frontmatter + file path.

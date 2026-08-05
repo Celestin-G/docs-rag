@@ -60,7 +60,7 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(path))
-		if ext != ".md" && ext != ".mdx" {
+		if ext != ".md" && ext != ".mdx" && ext != ".json" {
 			return nil
 		}
 		rel, _ := filepath.Rel(docsPath, path)
@@ -85,7 +85,12 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 			continue
 		}
 
-		chunks := chunker.ParseFile(relPath, content)
+		var chunks []chunker.Chunk
+		if strings.EqualFold(filepath.Ext(relPath), ".json") {
+			chunks = chunker.ParseGeneratedJSON(relPath, content)
+		} else {
+			chunks = chunker.ParseFile(relPath, content)
+		}
 		if len(chunks) == 0 {
 			continue
 		}
@@ -106,7 +111,7 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 				Section:    c.Section,
 				Content:    c.Content,
 				Embedding:  embeddings[j],
-			}, c.Badge, c.VersionNum, c.Deployment); err != nil {
+			}, c.Badge, c.VersionNum, c.VersionBelow, c.Deployment); err != nil {
 				return fmt.Errorf("insert chunk from %s: %w", relPath, err)
 			}
 		}
@@ -123,6 +128,12 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 // This excludes project meta-files (CLAUDE.md, README.md at root) and internal
 // tooling packages (docs-framework, vcc) that pollute search results.
 func isDocFile(rel string) bool {
+	// The generated data files are the only JSON worth reading: they hold the API
+	// operations, request/response schemas and fctl commands that the reference
+	// pages render at build time. Every other JSON in the repo is tooling config.
+	if strings.HasSuffix(rel, ".json") {
+		return strings.HasPrefix(rel, "apps/docs/content/data/generated/")
+	}
 	// Keep everything under apps/docs/content/ (pages + fragments)
 	if strings.HasPrefix(rel, "apps/docs/content/") {
 		return true

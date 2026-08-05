@@ -22,7 +22,14 @@ CREATE TABLE doc_chunks (
   embedding   vector(768),
   content_tsv TSVECTOR,
   badge       TEXT,
-  version_num SMALLINT,
+  -- version_num is the lower bound: the stack version this content appears in.
+  -- version_below is the exclusive upper bound, NULL when the content still
+  -- applies to the latest version. The pair mirrors the docs framework's
+  -- version-composition ranges ({min: "v3.0", below: "v3.1"}), which a single
+  -- lower bound cannot express — without it, v3.0 API operations surface for a
+  -- question scoped to v3.2.
+  version_num   SMALLINT,
+  version_below SMALLINT,
   deployment  TEXT NOT NULL DEFAULT 'both',
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );

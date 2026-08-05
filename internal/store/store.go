@@ -46,26 +46,36 @@ type DocChunk struct {
 type SearchFilter struct {
 	License    string // "ee" (no filter) or "community" (exclude enterprise pages)
 	Deployment string // "cloud", "self-hosted", or "both" (no filter)
-	VersionNum int16  // 0=no filter; 30/31/32/33 = max stack version to include
+	// VersionNum is the stack version being asked about: 0=no filter, else
+	// 30/31/32/33. A chunk is eligible when this version falls inside its
+	// [version_num, version_below) range.
+	VersionNum int16
 }
 
-// Insert stores a single chunk in the database.
-func (s *Store) Insert(ctx context.Context, chunk DocChunk, badge string, versionNum int16, deployment string) error {
-	var vn interface{}
-	if versionNum > 0 {
-		vn = versionNum
+// Insert stores a single chunk in the database. versionNum is the lower version
+// bound and versionBelow the exclusive upper bound; pass 0 for either to mean
+// unbounded on that side.
+func (s *Store) Insert(ctx context.Context, chunk DocChunk, badge string, versionNum, versionBelow int16, deployment string) error {
+	// Zero means "no bound" and must reach SQL as NULL, not as 0: the filters
+	// treat NULL as unbounded but would compare a literal 0.
+	nullIfZero := func(v int16) interface{} {
+		if v > 0 {
+			return v
+		}
+		return nil
 	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO doc_chunks (source_file, section, content, embedding, content_tsv, badge, version_num, deployment)
+		`INSERT INTO doc_chunks (source_file, section, content, embedding, content_tsv, badge, version_num, version_below, deployment)
 		 VALUES ($1, $2, $3, $4::vector,
 		         to_tsvector('english', coalesce($2, '') || ' ' || $3),
-		         $5, $6, $7)`,
+		         $5, $6, $7, $8)`,
 		chunk.SourceFile,
 		chunk.Section,
 		chunk.Content,
 		pgvector.NewVector(chunk.Embedding).String(),
 		badge,
-		vn,
+		nullIfZero(versionNum),
+		nullIfZero(versionBelow),
 		deployment,
 	)
 	if err != nil {
@@ -94,6 +104,7 @@ func (s *Store) searchVector(ctx context.Context, vec string, topK int, minScore
 		   ($2::text = 'both' OR deployment = 'both' OR deployment = $2::text)
 		   AND ($3::text = 'ee' OR badge IS NULL OR badge != 'enterprise')
 		   AND ($4::smallint = 0 OR version_num IS NULL OR version_num <= $4::smallint)
+		   AND ($4::smallint = 0 OR version_below IS NULL OR $4::smallint < version_below)
 		 ORDER BY embedding <=> $1::vector
 		 LIMIT $5`,
 		vec, f.Deployment, f.License, f.VersionNum, topK,
@@ -115,6 +126,7 @@ func (s *Store) searchHybrid(ctx context.Context, vec string, textQuery string, 
 		   ($3::text = 'both' OR deployment = 'both' OR deployment = $3::text)
 		   AND ($4::text = 'ee' OR badge IS NULL OR badge != 'enterprise')
 		   AND ($5::smallint = 0 OR version_num IS NULL OR version_num <= $5::smallint)
+		   AND ($5::smallint = 0 OR version_below IS NULL OR $5::smallint < version_below)
 		 ORDER BY score DESC
 		 LIMIT $6`,
 		vec, textQuery, f.Deployment, f.License, f.VersionNum, topK,
