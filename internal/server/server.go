@@ -162,6 +162,8 @@ type sseEvent struct {
 type source struct {
 	File    string `json:"file"`
 	Section string `json:"section,omitempty"`
+	// URL is the public documentation page, empty for fragments that have none.
+	URL string `json:"url,omitempty"`
 }
 
 // sseWriter wraps ResponseWriter to format writes as SSE data frames.
@@ -425,6 +427,8 @@ header{background:var(--emerald);height:48px;padding:0 24px;display:flex;align-i
 .sources{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .chip{font-family:var(--mono);font-size:11px;background:var(--emerald);color:var(--mint);padding:3px 10px;border-radius:2px;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default;letter-spacing:.02em;transition:background .12s}
 .chip:hover{background:var(--emerald-10)}
+a.chip{cursor:pointer;text-decoration:none}
+a.chip:hover{text-decoration:underline}
 
 /* Feedback buttons */
 .fb-row{display:flex;align-items:center;gap:8px;margin-top:10px;padding-top:8px;border-top:1px solid var(--slate)}
@@ -699,14 +703,24 @@ form.addEventListener('submit', async function(e) {
         } else if (ev.type === 'sources' && ev.sources) {
           var srcDiv = document.createElement('div');
           srcDiv.className = 'sources';
-          var seen = {};
-          ev.sources.forEach(function(s) {
-            if (seen[s.file]) return;
-            seen[s.file] = true;
-            var chip = document.createElement('div');
+          // Numbered, in order, with no deduplication: the answer cites [n] by
+          // position, so every entry must be shown for those markers to resolve
+          // to something. The same page can legitimately appear twice for two
+          // different sections.
+          ev.sources.forEach(function(s, i) {
+            var chip;
+            if (s.url) {
+              chip = document.createElement('a');
+              chip.href = s.url;
+              chip.target = '_blank';
+              chip.rel = 'noopener noreferrer';
+            } else {
+              // Fragments are partials included by other pages: nothing to link to.
+              chip = document.createElement('div');
+            }
             chip.className = 'chip';
             chip.title = s.section ? s.file + ' › ' + s.section : s.file;
-            chip.textContent = '_ ' + filename(s.file);
+            chip.textContent = '[' + (i + 1) + '] ' + filename(s.file);
             srcDiv.appendChild(chip);
           });
           aDiv.appendChild(srcDiv);
@@ -717,7 +731,7 @@ form.addEventListener('submit', async function(e) {
           // Feedback buttons
           var fbRow = document.createElement('div');
           fbRow.className = 'fb-row';
-          fbRow.innerHTML = '<span class="fb-label">Cette réponse t\'a aidé ?</span>'
+          fbRow.innerHTML = '<span class="fb-label">Was this helpful?</span>'
             + '<button class="fb-btn" data-r="1">👍</button>'
             + '<button class="fb-btn" data-r="-1">👎</button>';
           fbRow.querySelectorAll('.fb-btn').forEach(function(fb) {
@@ -725,7 +739,7 @@ form.addEventListener('submit', async function(e) {
               fetch('/api/feedback', {method:'POST', headers:{'Content-Type':'application/json'},
                 body: JSON.stringify({question: question, answer: text, rating: parseInt(fb.getAttribute('data-r'))})});
               fbRow.innerHTML = '<span class="fb-thanks">'
-                + (parseInt(fb.getAttribute('data-r')) === 1 ? 'Merci 😊' : 'Merci, on améliore 📌')
+                + (parseInt(fb.getAttribute('data-r')) === 1 ? 'Thanks 😊' : 'Thanks — noted 📌')
                 + '</span>';
             });
           });

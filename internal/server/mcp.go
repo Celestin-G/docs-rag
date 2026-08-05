@@ -98,7 +98,7 @@ func (s *srv) askDocs(ctx context.Context, _ *mcp.CallToolRequest, in askDocsInp
 			Citation: i + 1, // the prompt numbers excerpts [1], [2], … in this order
 			File:     src.File,
 			Section:  src.Section,
-			URL:      sourceURL(src.File),
+			URL:      src.URL,
 		}
 	}
 	return nil, out, nil
