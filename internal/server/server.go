@@ -342,6 +342,7 @@ func (s *srv) handleStatsPage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, statsPageHTML,
+		st.IndexedChunks, st.NoResultsRateToday*100, st.NoResultsRate*100,
 		st.TotalRequests, st.RequestsToday,
 		int(st.AvgDurationMs), st.ErrorRate*100,
 		st.TotalFeedback, positiveStr,
@@ -349,7 +350,7 @@ func (s *srv) handleStatsPage(w http.ResponseWriter, r *http.Request) {
 }
 
 const statsPageHTML = `<!DOCTYPE html>
-<html lang="fr"><head>
+<html lang="en"><head>
 <meta charset="UTF-8">
 <title>Stats — Formance Docs RAG</title>
 <style>
@@ -369,16 +370,22 @@ h1{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#7A9396;mar
 <h1>_stats/ Formance Docs RAG</h1>
 <div class="grid">
   <div class="card">
-    <div class="card-title">Requetes</div>
+    <div class="card-title">Index health</div>
+    <div class="stat"><span class="stat-label">Indexed chunks</span><span class="stat-value">%d</span></div>
+    <div class="stat"><span class="stat-label">No results today</span><span class="stat-value">%.1f<small>%%</small></span></div>
+    <div class="stat"><span class="stat-label">No results all time</span><span class="stat-value">%.1f<small>%%</small></span></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Requests</div>
     <div class="stat"><span class="stat-label">Total</span><span class="stat-value">%d</span></div>
-    <div class="stat"><span class="stat-label">Aujourd'hui</span><span class="stat-value">%d</span></div>
-    <div class="stat"><span class="stat-label">Duree moyenne</span><span class="stat-value">%d<small>ms</small></span></div>
-    <div class="stat"><span class="stat-label">Taux d'erreur</span><span class="stat-value">%.1f<small>%%</small></span></div>
+    <div class="stat"><span class="stat-label">Today</span><span class="stat-value">%d</span></div>
+    <div class="stat"><span class="stat-label">Avg duration</span><span class="stat-value">%d<small>ms</small></span></div>
+    <div class="stat"><span class="stat-label">Error rate</span><span class="stat-value">%.1f<small>%%</small></span></div>
   </div>
   <div class="card">
     <div class="card-title">Feedback</div>
-    <div class="stat"><span class="stat-label">Total feedbacks</span><span class="stat-value">%d</span></div>
-    <div class="stat"><span class="stat-label">Reponses positives</span><span class="stat-value">%s</span></div>
+    <div class="stat"><span class="stat-label">Total</span><span class="stat-value">%d</span></div>
+    <div class="stat"><span class="stat-label">Positive</span><span class="stat-value">%s</span></div>
   </div>
 </div>
 </body></html>`
@@ -386,7 +393,7 @@ h1{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#7A9396;mar
 // --- Embedded UI --------------------------------------------------------------
 
 const ui = `<!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">

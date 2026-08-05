@@ -298,6 +298,18 @@ type Stats struct {
 	ErrorRate     float64 `json:"error_rate"`
 	TotalFeedback int     `json:"total_feedback"`
 	PositiveRate  float64 `json:"positive_rate"`
+
+	// IndexedChunks is how many chunks the index currently holds. Zero means the
+	// service answers nothing at all, and it is the only signal here that does
+	// not need traffic to show a problem.
+	IndexedChunks int `json:"indexed_chunks"`
+	// NoResultsRate counts answers where retrieval came back empty. It is not an
+	// error — the service worked, it just had nothing to say — so it never
+	// reached ErrorRate, which is how an empty index went unnoticed for three
+	// days behind a 0% error rate. Today's figure is the one to watch: a broken
+	// re-ingest sends it straight to 100% while the all-time rate barely moves.
+	NoResultsRate      float64 `json:"no_results_rate"`
+	NoResultsRateToday float64 `json:"no_results_rate_today"`
 }
 
 // GetStats returns aggregated request and feedback statistics.
@@ -309,11 +321,22 @@ func (s *Store) GetStats(ctx context.Context) (Stats, error) {
 		  COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE)               AS requests_today,
 		  COALESCE(AVG(duration_ms), 0)                                    AS avg_duration_ms,
 		  COALESCE(COUNT(*) FILTER (WHERE status = 'error')::float /
-		           NULLIF(COUNT(*), 0), 0)                                 AS error_rate
+		           NULLIF(COUNT(*), 0), 0)                                 AS error_rate,
+		  COALESCE(COUNT(*) FILTER (WHERE status = 'no_results')::float /
+		           NULLIF(COUNT(*), 0), 0)                                 AS no_results_rate,
+		  COALESCE(COUNT(*) FILTER (WHERE status = 'no_results'
+		                              AND created_at >= CURRENT_DATE)::float /
+		           NULLIF(COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE), 0), 0)
+		                                                                   AS no_results_rate_today
 		FROM request_logs
-	`).Scan(&st.TotalRequests, &st.RequestsToday, &st.AvgDurationMs, &st.ErrorRate)
+	`).Scan(&st.TotalRequests, &st.RequestsToday, &st.AvgDurationMs, &st.ErrorRate,
+		&st.NoResultsRate, &st.NoResultsRateToday)
 	if err != nil {
 		return st, fmt.Errorf("stats requests: %w", err)
+	}
+
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM doc_chunks`).Scan(&st.IndexedChunks); err != nil {
+		return st, fmt.Errorf("stats indexed chunks: %w", err)
 	}
 	err = s.pool.QueryRow(ctx, `
 		SELECT
