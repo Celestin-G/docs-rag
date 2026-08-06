@@ -37,11 +37,17 @@ func TestVisibilityPredicate(t *testing.T) {
 	defer pool.Close()
 
 	for name, tc := range map[string]struct {
-		visibility string // what the page declares; "null" for an ungated page
+		// visibility is what the page declares. nil is an ungated page: Insert
+		// leaves the column NULL rather than writing a JSON value, and jsonb_each
+		// on NULL yields no rows. Passing the JSON scalar `null` here instead would
+		// raise "cannot call jsonb_each on a non-object" — a state the writer never
+		// produces.
+		visibility interface{}
 		selected   string // what the caller asked for
 		want       bool   // eligible?
 	}{
-		"ungated page is always eligible":     {`null`, `{"numscript":"legacy"}`, true},
+		"ungated page is always eligible":     {nil, `{"numscript":"legacy"}`, true},
+		"empty object gates nothing":          {`{}`, `{"numscript":"legacy"}`, true},
 		"matching value is eligible":          {`{"numscript":["new"]}`, `{"numscript":"new"}`, true},
 		"non-matching value is excluded":      {`{"numscript":["new"]}`, `{"numscript":"legacy"}`, false},
 		"unselected dimension does not gate":  {`{"numscript":["new"]}`, `{}`, true},
@@ -56,7 +62,7 @@ func TestVisibilityPredicate(t *testing.T) {
 				t.Fatalf("query: %v", err)
 			}
 			if got != tc.want {
-				t.Errorf("visibility=%s selected=%s → eligible=%v, want %v",
+				t.Errorf("visibility=%v selected=%s → eligible=%v, want %v",
 					tc.visibility, tc.selected, got, tc.want)
 			}
 		})
