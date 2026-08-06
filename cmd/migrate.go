@@ -8,13 +8,31 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// migrationSQL drops and recreates the table to handle dimension changes across runs.
+// migrationSQL brings the schema up to date without destroying anything.
+//
+// It used to DROP and recreate doc_chunks, which was convenient while the
+// columns were still moving but made the migration impossible to run before a
+// release: dropping the table empties the index, so the schema could only be
+// updated during the nightly ingest, and a server deployed before that ran
+// queried columns that did not exist yet. Every column added so far is purely
+// additive, so ADD COLUMN IF NOT EXISTS reaches the same schema while the
+// existing rows keep serving. New columns read as unconstrained on old rows —
+// visibility NULL is an ungated page, version_below NULL an open upper bound —
+// so the gating is merely as coarse as before until the next ingest, never wrong
+// in a way that hides documentation.
+//
+// Being idempotent is what lets this run as an init container on the server
+// itself, which is the only way to guarantee the schema is in place before the
+// first request rather than hoping an out-of-band job ran first.
 const migrationSQL = `
 CREATE EXTENSION IF NOT EXISTS vector;
 
-DROP TABLE IF EXISTS doc_chunks;
+-- Serialise concurrent migrations: replicas start together, and two sessions
+-- both finding a column missing would otherwise race to add it. Transaction
+-- scoped, so it is released whatever happens below.
+SELECT pg_advisory_xact_lock(hashtext('docs_rag_migrate'));
 
-CREATE TABLE doc_chunks (
+CREATE TABLE IF NOT EXISTS doc_chunks (
   id          SERIAL PRIMARY KEY,
   source_file TEXT NOT NULL,
   section     TEXT,
@@ -48,10 +66,22 @@ CREATE TABLE doc_chunks (
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX doc_chunks_embedding_idx
+-- Columns added after the table first shipped. The CREATE above already lists
+-- them for a fresh database; these bring an existing one to the same shape.
+-- Keep the two in step: a column added in one and not the other means the
+-- schema depends on whether the database is new, which is the worst kind of
+-- difference to debug.
+ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS badge             TEXT;
+ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS version_num       SMALLINT;
+ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS version_below     SMALLINT;
+ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS version_component TEXT NOT NULL DEFAULT 'stack';
+ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS visibility        JSONB;
+ALTER TABLE doc_chunks ADD COLUMN IF NOT EXISTS deployment        TEXT NOT NULL DEFAULT 'both';
+
+CREATE INDEX IF NOT EXISTS doc_chunks_embedding_idx
   ON doc_chunks USING hnsw (embedding vector_cosine_ops);
 
-CREATE INDEX doc_chunks_tsv_idx
+CREATE INDEX IF NOT EXISTS doc_chunks_tsv_idx
   ON doc_chunks USING GIN(content_tsv);
 
 -- Feedback and analytics tables survive re-migration (IF NOT EXISTS).
