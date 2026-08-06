@@ -1,6 +1,7 @@
 package chunker
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -108,6 +109,70 @@ func TestParseGeneratedJSONGenericFallback(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("content missing %q, got:\n%s", want, got)
 		}
+	}
+}
+
+// The RBAC scopes, the OTel metrics and the audit events are plain lists. The
+// pages that show them are one-line <DocDataTable> wrappers with no prose of
+// their own, so skipping this shape put the content nowhere in the index.
+func TestParseGeneratedJSONListShape(t *testing.T) {
+	src := `{"membership.scopes":[
+	  {"label":"stack:Read","category":"Stack","description":"Read-only access"},
+	  {"label":"stack:Write","category":"Stack","description":"Write access"}
+	]}`
+
+	chunks := ParseGeneratedJSON("apps/docs/content/data/generated/membership.scopes.json", []byte(src))
+	if len(chunks) != 1 {
+		t.Fatalf("got %d chunks, want the whole list in 1", len(chunks))
+	}
+	got := chunks[0].Content
+	for _, want := range []string{"membership.scopes", "- stack:Read — category: Stack; description: Read-only access", "- stack:Write"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("content missing %q, got:\n%s", want, got)
+		}
+	}
+	if chunks[0].Section != "membership.scopes" {
+		t.Errorf("section = %q, want the dataset name", chunks[0].Section)
+	}
+}
+
+// A list is kept whole while it fits: retrieval admits two chunks per file, so
+// a list split into several parts could never come back complete.
+func TestParseGeneratedJSONListSplitsOnlyWhenTooLarge(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"big.list":[`)
+	for i := 0; i < 400; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"name":"entry-%03d","description":"a description long enough to matter"}`, i)
+	}
+	b.WriteString(`]}`)
+
+	chunks := ParseGeneratedJSON("apps/docs/content/data/generated/big.list.json", []byte(b.String()))
+	if len(chunks) < 2 {
+		t.Fatalf("got %d chunks, want the oversized list split", len(chunks))
+	}
+	for i, c := range chunks {
+		if len(c.Content) > maxDataChunkBytes {
+			t.Errorf("chunk %d is %d bytes, over the %d limit", i, len(c.Content), maxDataChunkBytes)
+		}
+		if !strings.HasPrefix(c.Content, "big.list\n\n") {
+			t.Errorf("chunk %d should name its dataset so it reads standalone, got:\n%.60s", i, c.Content)
+		}
+	}
+}
+
+// Scalars are one-line datasets — the minimum Kubernetes version, the Helm
+// chart URL. The value alone matches nothing, so the name has to travel with it.
+func TestParseGeneratedJSONScalarShape(t *testing.T) {
+	chunks := ParseGeneratedJSON("z.json", []byte(`{"infra.k8s-min-version":"1.30"}`))
+	if len(chunks) != 1 {
+		t.Fatalf("got %d chunks, want 1", len(chunks))
+	}
+	got := chunks[0].Content
+	if !strings.Contains(got, "infra.k8s-min-version") || !strings.Contains(got, "1.30") {
+		t.Errorf("content should carry both the name and the value, got:\n%s", got)
 	}
 }
 

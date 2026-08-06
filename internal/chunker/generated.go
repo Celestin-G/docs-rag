@@ -14,13 +14,17 @@ import (
 // schemas and CLI commands exist nowhere else as text — and an ingestion that
 // only reads .md/.mdx cannot see any of it.
 //
-// Two shapes appear. Most datasets are version-composed:
+// Three shapes appear. Most datasets are version-composed:
 //
 //	{"api.operations": {"__component": "stack", "__versions": [
 //	   {"range": {"min": "v3.0", "below": "v3.1"}, "data": {"<id>": {...}}}]}}
 //
-// A few carry no version composition and are a flat map of entries instead
-// (api.fctl, for one). Both are handled.
+// Some carry no version composition and are a flat map of entries instead
+// (api.fctl, for one). The rest are a plain list of records — the RBAC scopes,
+// the OTel metrics, the audit lifecycle events — or a bare scalar, such as the
+// minimum Kubernetes version. All are handled: the pages that display them are
+// one-line wrappers around a <DocDataTable>, so a shape this parser skips is
+// documentation that exists nowhere in the index.
 
 type vccRange struct {
 	Min   string `json:"min"`
@@ -88,22 +92,130 @@ func ParseGeneratedJSON(relPath string, content []byte) []Chunk {
 		}
 		// Fall back to a flat map of entries, with no version bounds.
 		var flat map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &flat); err != nil {
+		if err := json.Unmarshal(raw, &flat); err == nil {
+			for _, id := range sortedKeys(flat) {
+				if text := renderEntry(dataset, id, flat[id]); text != "" {
+					out = append(out, dataChunk(relPath, sectionLabel(dataset, id), text))
+				}
+			}
 			continue
 		}
-		for _, id := range sortedKeys(flat) {
-			if text := renderEntry(dataset, id, flat[id]); text != "" {
-				out = append(out, Chunk{
-					SourceFile:       relPath,
-					Section:          sectionLabel(dataset, id),
-					Content:          text,
-					VersionComponent: "stack",
-					Deployment:       "both",
-				})
-			}
+		// Neither an object nor a map: a list of records, or a scalar.
+		out = append(out, chunksFromValue(relPath, dataset, raw)...)
+	}
+	return out
+}
+
+// maxDataChunkBytes bounds a group of records. It is deliberately larger than
+// the markdown maxChunkBytes: that limit exists to keep prose retrieval precise,
+// whereas a reference table answers the question only as a whole — half the RBAC
+// scopes is a wrong answer, not a partial one. Retrieval also admits at most two
+// chunks per source file, so a list split into four parts could never come back
+// complete. 6000 bytes holds every list in the corpus today and stays well
+// inside the embedding model's window.
+const maxDataChunkBytes = 6000
+
+// chunksFromValue renders a dataset that is a list of records or a scalar.
+// Neither shape carries version information.
+func chunksFromValue(relPath, dataset string, raw json.RawMessage) []Chunk {
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return nil
+	}
+
+	list, ok := v.([]any)
+	if !ok {
+		// A scalar is one short chunk. Naming the dataset alongside the value is
+		// what makes it retrievable: "1.30" on its own matches nothing.
+		text := flatten(v)
+		if text == "" {
+			return nil
+		}
+		return []Chunk{dataChunk(relPath, dataset, dataset+"\n\n"+text)}
+	}
+
+	var out []Chunk
+	var b strings.Builder
+	flush := func() {
+		if b.Len() > 0 {
+			out = append(out, dataChunk(relPath, dataset, strings.TrimSpace(b.String())))
+			b.Reset()
+		}
+	}
+	for _, e := range list {
+		line := renderRecord(e)
+		if line == "" {
+			continue
+		}
+		if b.Len() > 0 && b.Len()+len(line) > maxDataChunkBytes {
+			flush()
+		}
+		if b.Len() == 0 {
+			b.WriteString(dataset + "\n\n")
+		}
+		b.WriteString(line + "\n")
+	}
+	flush()
+	return out
+}
+
+// recordKeys are the fields a list record uses to name itself, most specific
+// first. Leading with the name makes the line read as a statement about that
+// scope or metric rather than as an anonymous row.
+var recordKeys = []string{"label", "name", "metric", "event", "field", "id", "key"}
+
+// renderRecord renders one element of a list dataset as a single line.
+func renderRecord(e any) string {
+	m, ok := e.(map[string]any)
+	if !ok {
+		if s := flatten(e); s != "" {
+			return "- " + s
+		}
+		return ""
+	}
+	var label string
+	for _, k := range recordKeys {
+		if s := str(m[k]); s != "" {
+			label, m = s, omit(m, k)
+			break
+		}
+	}
+	parts := make([]string, 0, len(m))
+	for _, k := range sortedAnyKeys(m) {
+		if s := flatten(m[k]); s != "" {
+			parts = append(parts, k+": "+s)
+		}
+	}
+	switch {
+	case label != "" && len(parts) > 0:
+		return "- " + label + " — " + strings.Join(parts, "; ")
+	case label != "":
+		return "- " + label
+	case len(parts) > 0:
+		return "- " + strings.Join(parts, "; ")
+	}
+	return ""
+}
+
+// omit returns a copy of m without key k, leaving the caller's map untouched.
+func omit(m map[string]any, k string) map[string]any {
+	out := make(map[string]any, len(m))
+	for key, v := range m {
+		if key != k {
+			out[key] = v
 		}
 	}
 	return out
+}
+
+func dataChunk(relPath, section, text string) Chunk {
+	return Chunk{
+		SourceFile:       relPath,
+		Section:          section,
+		Content:          text,
+		VersionComponent: "stack",
+		Deployment:       "both",
+	}
 }
 
 // chunksFromVersions walks one dataset's version ranges, rendering each entry
