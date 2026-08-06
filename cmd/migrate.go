@@ -22,7 +22,28 @@ CREATE TABLE doc_chunks (
   embedding   vector(768),
   content_tsv TSVECTOR,
   badge       TEXT,
-  version_num SMALLINT,
+  -- version_num is the lower bound: the stack version this content appears in.
+  -- version_below is the exclusive upper bound, NULL when the content still
+  -- applies to the latest version. The pair mirrors the docs framework's
+  -- version-composition ranges ({min: "v3.0", below: "v3.1"}), which a single
+  -- lower bound cannot express — without it, v3.0 API operations surface for a
+  -- question scoped to v3.2.
+  version_num   SMALLINT,
+  version_below SMALLINT,
+  -- Which component the version bounds are expressed against. Pages declare it
+  -- in frontmatter as "component: numscript-interpreter" and default to the
+  -- stack. Without it a ledger "2.3" constraint reads as stack v2.3 and a
+  -- "0.0.15" interpreter constraint collapses to zero, so both stop filtering
+  -- anything. Only stack-scoped bounds are compared against the stack version
+  -- the user selects; the rest are stored for the per-component cascade, which
+  -- needs the framework's composition graph to be machine-readable first.
+  version_component TEXT NOT NULL DEFAULT 'stack',
+  -- Which dimension values the page applies to, e.g. {"numscript": ["new"]}.
+  -- This is how the docs hide experimental features: a page carrying
+  -- visibility.numscript = new does not exist when the Legacy Machine is
+  -- selected. Distinct from the version bounds above — a page can be gated on a
+  -- dimension without any version constraint, and the reverse.
+  visibility JSONB,
   deployment  TEXT NOT NULL DEFAULT 'both',
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );

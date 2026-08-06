@@ -76,11 +76,15 @@ type FilterContext struct {
 	Deployment string   // "cloud", "self-hosted", "both"
 	Version    string   // e.g. "3.2"
 	EEFeatures []string // enterprise-only feature names, derived from DB badges
+	// Experimental is true when at least one retrieved excerpt comes from a page
+	// badged experimental. Those features need opting in at three levels, and an
+	// answer that omits that reads as if they were generally available.
+	Experimental bool
 }
 
 // Message is a single turn in the conversation history.
 type Message struct {
-	Role    string `json:"role"`    // "user" or "assistant"
+	Role    string `json:"role"` // "user" or "assistant"
 	Content string `json:"content"`
 }
 
@@ -237,6 +241,14 @@ func buildSystem(chunks []ContextChunk, filter FilterContext) string {
 	} else {
 		sb.WriteString("- License: Enterprise (EE) — all features are available.\n")
 	}
+	if filter.Experimental {
+		sb.WriteString("- Some excerpts below come from pages marked **experimental**.\n")
+		// Stated unconditionally, as the interpreter documentation states them: the
+		// docs schema gates the Numscript dimension on the Ledger version alone, not
+		// on deployment, so there is no basis for varying this by cloud vs
+		// self-hosted.
+		sb.WriteString("  CRITICAL RULE: an experimental Numscript feature is never available by default. If your answer relies on one, say so before showing it, never present it as generally available, and state all three things needed to use it: `runtime: experimental-interpreter` in the transaction request body (the default is `machine`), the Ledger settings `ledger.experimental-features` and `ledger.experimental-numscript` set to true, and the feature's own `#![feature(...)]` flag. Name the Ledger or Stack version it requires when the excerpts give it.\n")
+	}
 	sb.WriteString("\n")
 
 	sb.WriteString("## Technical facts — must come exclusively from the documentation excerpts below\n")
@@ -277,4 +289,3 @@ func buildSystem(chunks []ContextChunk, filter FilterContext) string {
 	sb.WriteString("=== END OF DOCUMENTATION ===")
 	return sb.String()
 }
-

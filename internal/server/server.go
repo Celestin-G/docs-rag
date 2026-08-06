@@ -39,6 +39,10 @@ type srv struct {
 	eeMu        sync.Mutex
 	eeFeatures  []string
 	eeFetchedAt time.Time
+
+	verMu        sync.Mutex
+	verOptions   string
+	verFetchedAt time.Time
 }
 
 // enterpriseFeatures returns the EE feature list for the system prompt,
@@ -137,9 +141,40 @@ func (s *srv) cleanupLimiters() {
 	}
 }
 
-func (s *srv) handleIndex(w http.ResponseWriter, _ *http.Request) {
+// versionOptions renders the stack-version picker from the versions actually
+// present in the index, cached for 5 minutes. Falling back to an empty list on
+// error is deliberate: an empty picker means "no version filter", which returns
+// more than intended rather than silently returning nothing.
+func (s *srv) versionOptions(ctx context.Context) string {
+	s.verMu.Lock()
+	defer s.verMu.Unlock()
+	if time.Since(s.verFetchedAt) < 5*time.Minute && s.verOptions != "" {
+		return s.verOptions
+	}
+	versions, err := s.store.StackVersions(ctx)
+	if err != nil {
+		log.Printf("stack versions lookup: %v", err)
+		return s.verOptions // possibly stale, better than nothing
+	}
+
+	var b strings.Builder
+	for i, v := range versions {
+		label := fmt.Sprintf("%d.%d", v/10, v%10)
+		// Default to the newest: the question is almost always about today.
+		sel := ""
+		if i == len(versions)-1 {
+			sel = " selected"
+		}
+		fmt.Fprintf(&b, `<option value="%s"%s>v%s</option>`, label, sel, label)
+	}
+	s.verOptions = b.String()
+	s.verFetchedAt = time.Now()
+	return s.verOptions
+}
+
+func (s *srv) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, ui)
+	fmt.Fprint(w, strings.Replace(ui, "<!--VERSION_OPTIONS-->", s.versionOptions(r.Context()), 1))
 }
 
 // --- /api/ask -----------------------------------------------------------------
@@ -148,9 +183,27 @@ type askReq struct {
 	Question   string        `json:"question"`
 	TopK       int           `json:"top_k"`
 	History    []llm.Message `json:"history"`
-	Version    string        `json:"version"`    // "3.0","3.1","3.2","3.3"
+	Version    string        `json:"version"`    // "3.0","3.1","3.2"
 	Deployment string        `json:"deployment"` // "cloud","self-hosted","both"
 	License    string        `json:"license"`    // "ee","community"
+	// Docs dimensions. Pages declare which values they apply to, so selecting one
+	// hides the pages that do not. Numscript is the one that gates experimental
+	// features; SDK matters because the docs carry per-language variants and
+	// answering a Go question with a TypeScript snippet is worse than useless.
+	Numscript string `json:"numscript"` // "new","legacy"
+	SDK       string `json:"sdk"`       // "typescript","go","python","java","csharp","php"
+}
+
+// dimensions renders the request's dimension selections for the search filter.
+// Empty values are omitted: an unspecified dimension must not filter anything.
+func (r *askReq) dimensions() map[string]string {
+	d := map[string]string{}
+	for k, v := range map[string]string{"numscript": r.Numscript, "sdk": r.SDK} {
+		if v != "" {
+			d[k] = v
+		}
+	}
+	return d
 }
 
 type sseEvent struct {
@@ -162,6 +215,8 @@ type sseEvent struct {
 type source struct {
 	File    string `json:"file"`
 	Section string `json:"section,omitempty"`
+	// URL is the public documentation page, empty for fragments that have none.
+	URL string `json:"url,omitempty"`
 }
 
 // sseWriter wraps ResponseWriter to format writes as SSE data frames.
@@ -305,6 +360,7 @@ func (s *srv) handleStatsPage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, statsPageHTML,
+		st.IndexedChunks, st.NoResultsRateToday*100, st.NoResultsRate*100,
 		st.TotalRequests, st.RequestsToday,
 		int(st.AvgDurationMs), st.ErrorRate*100,
 		st.TotalFeedback, positiveStr,
@@ -312,7 +368,7 @@ func (s *srv) handleStatsPage(w http.ResponseWriter, r *http.Request) {
 }
 
 const statsPageHTML = `<!DOCTYPE html>
-<html lang="fr"><head>
+<html lang="en"><head>
 <meta charset="UTF-8">
 <title>Stats — Formance Docs RAG</title>
 <style>
@@ -332,16 +388,22 @@ h1{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#7A9396;mar
 <h1>_stats/ Formance Docs RAG</h1>
 <div class="grid">
   <div class="card">
-    <div class="card-title">Requetes</div>
+    <div class="card-title">Index health</div>
+    <div class="stat"><span class="stat-label">Indexed chunks</span><span class="stat-value">%d</span></div>
+    <div class="stat"><span class="stat-label">No results today</span><span class="stat-value">%.1f<small>%%</small></span></div>
+    <div class="stat"><span class="stat-label">No results all time</span><span class="stat-value">%.1f<small>%%</small></span></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Requests</div>
     <div class="stat"><span class="stat-label">Total</span><span class="stat-value">%d</span></div>
-    <div class="stat"><span class="stat-label">Aujourd'hui</span><span class="stat-value">%d</span></div>
-    <div class="stat"><span class="stat-label">Duree moyenne</span><span class="stat-value">%d<small>ms</small></span></div>
-    <div class="stat"><span class="stat-label">Taux d'erreur</span><span class="stat-value">%.1f<small>%%</small></span></div>
+    <div class="stat"><span class="stat-label">Today</span><span class="stat-value">%d</span></div>
+    <div class="stat"><span class="stat-label">Avg duration</span><span class="stat-value">%d<small>ms</small></span></div>
+    <div class="stat"><span class="stat-label">Error rate</span><span class="stat-value">%.1f<small>%%</small></span></div>
   </div>
   <div class="card">
     <div class="card-title">Feedback</div>
-    <div class="stat"><span class="stat-label">Total feedbacks</span><span class="stat-value">%d</span></div>
-    <div class="stat"><span class="stat-label">Reponses positives</span><span class="stat-value">%s</span></div>
+    <div class="stat"><span class="stat-label">Total</span><span class="stat-value">%d</span></div>
+    <div class="stat"><span class="stat-label">Positive</span><span class="stat-value">%s</span></div>
   </div>
 </div>
 </body></html>`
@@ -349,7 +411,7 @@ h1{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#7A9396;mar
 // --- Embedded UI --------------------------------------------------------------
 
 const ui = `<!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -425,6 +487,8 @@ header{background:var(--emerald);height:48px;padding:0 24px;display:flex;align-i
 .sources{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .chip{font-family:var(--mono);font-size:11px;background:var(--emerald);color:var(--mint);padding:3px 10px;border-radius:2px;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default;letter-spacing:.02em;transition:background .12s}
 .chip:hover{background:var(--emerald-10)}
+a.chip{cursor:pointer;text-decoration:none}
+a.chip:hover{text-decoration:underline}
 
 /* Feedback buttons */
 .fb-row{display:flex;align-items:center;gap:8px;margin-top:10px;padding-top:8px;border-top:1px solid var(--slate)}
@@ -440,7 +504,7 @@ header{background:var(--emerald);height:48px;padding:0 24px;display:flex;align-i
 .fsel{height:44px;font-family:var(--mono);font-size:11px;color:var(--emerald);background:#fff;border:1px solid var(--emerald-20);border-right:none;padding:0 20px 0 10px;cursor:pointer;outline:none;letter-spacing:.02em;-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='4' viewBox='0 0 8 4'%3E%3Cpath d='M0 0l4 4 4-4z' fill='%231a3a2a' opacity='.3'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 6px center;transition:border-color .12s;box-sizing:border-box}
 .fsel:hover,.fsel:focus{border-color:var(--emerald)}
 #sel-version{border-radius:2px 0 0 2px}
-#sel-license{border-right:1px solid var(--emerald-20);border-radius:0 2px 2px 0}
+#sel-sdk{border-right:1px solid var(--emerald-20);border-radius:0 2px 2px 0}
 .prefix{font-family:var(--mono);font-size:14px;color:var(--gold);background:var(--emerald);padding:10px 12px;border-radius:2px 0 0 2px;display:flex;align-items:center;flex-shrink:0;user-select:none;border:1px solid var(--emerald);border-right:none}
 #q{flex:1;padding:10px 14px;border:1px solid var(--emerald-20);border-left:none;border-right:none;background:#fff;font-size:14px;font-family:var(--mono);resize:none;min-height:44px;max-height:160px;outline:none;line-height:1.5;color:var(--emerald);border-radius:0;transition:border-color .12s}
 #q::placeholder{color:var(--emerald-20)}
@@ -474,15 +538,25 @@ header{background:var(--emerald);height:48px;padding:0 24px;display:flex;align-i
 <div id="form-wrap">
   <div id="fsel-group">
     <select id="sel-version" class="fsel">
-      <option value="3.0">v3.0</option>
-      <option value="3.1">v3.1</option>
-      <option value="3.2" selected>v3.2</option>
-      <option value="3.3">v3.3</option>
+      <!--VERSION_OPTIONS-->
     </select>
     <select id="sel-deploy" class="fsel">
       <option value="cloud" selected>Cloud</option>
       <option value="self-hosted">Self-hosted</option>
       <option value="both">Both</option>
+    </select>
+    <select id="sel-numscript" class="fsel" title="Numscript interpreter">
+      <option value="new" selected>New interpreter</option>
+      <option value="legacy">Legacy machine</option>
+    </select>
+    <select id="sel-sdk" class="fsel" title="SDK">
+      <option value="">Any SDK</option>
+      <option value="typescript">TypeScript</option>
+      <option value="go">Go</option>
+      <option value="python">Python</option>
+      <option value="java">Java</option>
+      <option value="csharp">C# / .NET</option>
+      <option value="php">PHP</option>
     </select>
     <select id="sel-license" class="fsel">
       <option value="ee" selected>EE</option>
@@ -503,6 +577,8 @@ var btn = document.getElementById('btn');
 var selVersion = document.getElementById('sel-version');
 var selDeploy = document.getElementById('sel-deploy');
 var selLicense = document.getElementById('sel-license');
+var selNumscript = document.getElementById('sel-numscript');
+var selSdk = document.getElementById('sel-sdk');
 var msgs = document.getElementById('messages');
 var chatHistory = [];
 
@@ -665,7 +741,7 @@ form.addEventListener('submit', async function(e) {
     var res = await fetch('/api/ask', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({question: question, top_k: 15, history: chatHistory, version: selVersion.value, deployment: selDeploy.value, license: selLicense.value})
+      body: JSON.stringify({question: question, top_k: 15, history: chatHistory, version: selVersion.value, deployment: selDeploy.value, license: selLicense.value, numscript: selNumscript.value, sdk: selSdk.value})
     });
     if (res.status === 429) {
       stopThinking();
@@ -699,14 +775,24 @@ form.addEventListener('submit', async function(e) {
         } else if (ev.type === 'sources' && ev.sources) {
           var srcDiv = document.createElement('div');
           srcDiv.className = 'sources';
-          var seen = {};
-          ev.sources.forEach(function(s) {
-            if (seen[s.file]) return;
-            seen[s.file] = true;
-            var chip = document.createElement('div');
+          // Numbered, in order, with no deduplication: the answer cites [n] by
+          // position, so every entry must be shown for those markers to resolve
+          // to something. The same page can legitimately appear twice for two
+          // different sections.
+          ev.sources.forEach(function(s, i) {
+            var chip;
+            if (s.url) {
+              chip = document.createElement('a');
+              chip.href = s.url;
+              chip.target = '_blank';
+              chip.rel = 'noopener noreferrer';
+            } else {
+              // Fragments are partials included by other pages: nothing to link to.
+              chip = document.createElement('div');
+            }
             chip.className = 'chip';
             chip.title = s.section ? s.file + ' › ' + s.section : s.file;
-            chip.textContent = '_ ' + filename(s.file);
+            chip.textContent = '[' + (i + 1) + '] ' + filename(s.file);
             srcDiv.appendChild(chip);
           });
           aDiv.appendChild(srcDiv);
@@ -717,7 +803,7 @@ form.addEventListener('submit', async function(e) {
           // Feedback buttons
           var fbRow = document.createElement('div');
           fbRow.className = 'fb-row';
-          fbRow.innerHTML = '<span class="fb-label">Cette réponse t\'a aidé ?</span>'
+          fbRow.innerHTML = '<span class="fb-label">Was this helpful?</span>'
             + '<button class="fb-btn" data-r="1">👍</button>'
             + '<button class="fb-btn" data-r="-1">👎</button>';
           fbRow.querySelectorAll('.fb-btn').forEach(function(fb) {
@@ -725,7 +811,7 @@ form.addEventListener('submit', async function(e) {
               fetch('/api/feedback', {method:'POST', headers:{'Content-Type':'application/json'},
                 body: JSON.stringify({question: question, answer: text, rating: parseInt(fb.getAttribute('data-r'))})});
               fbRow.innerHTML = '<span class="fb-thanks">'
-                + (parseInt(fb.getAttribute('data-r')) === 1 ? 'Merci 😊' : 'Merci, on améliore 📌')
+                + (parseInt(fb.getAttribute('data-r')) === 1 ? 'Thanks 😊' : 'Thanks — noted 📌')
                 + '</span>';
             });
           });

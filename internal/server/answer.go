@@ -61,6 +61,8 @@ func renderSources(sources []source) string {
 		if s.Section != "" {
 			fmt.Fprintf(&b, "%s — ", s.Section)
 		}
+		// Derived from the path rather than read from s.URL: pure and independent
+		// of whether the caller populated that field.
 		if u := sourceURL(s.File); u != "" {
 			b.WriteString(u)
 		} else {
@@ -110,7 +112,7 @@ func (s *srv) answer(ctx context.Context, req askReq, out io.Writer) (answerResu
 	}
 
 	// Build search filter from request parameters.
-	filter := store.SearchFilter{License: req.License, Deployment: req.Deployment}
+	filter := store.SearchFilter{License: req.License, Deployment: req.Deployment, Dimensions: req.dimensions()}
 	if filter.License == "" {
 		filter.License = "ee"
 	}
@@ -156,12 +158,20 @@ func (s *srv) answer(ctx context.Context, req askReq, out io.Writer) (answerResu
 	sources := make([]source, len(chunks))
 	for i, c := range chunks {
 		ctxChunks[i] = llm.ContextChunk{SourceFile: c.SourceFile, Section: c.Section, Content: c.Content}
-		sources[i] = source{File: c.SourceFile, Section: c.Section}
+		sources[i] = source{File: c.SourceFile, Section: c.Section, URL: sourceURL(c.SourceFile)}
 	}
 
 	filterCtx := llm.FilterContext{License: req.License, Deployment: req.Deployment, Version: req.Version}
 	if req.License == "community" {
 		filterCtx.EEFeatures = s.enterpriseFeatures(ctx)
+	}
+	// Warn about experimental features only when one was actually retrieved, so
+	// the rule costs nothing on the vast majority of questions.
+	for _, c := range chunks {
+		if c.Badge == "experimental" {
+			filterCtx.Experimental = true
+			break
+		}
 	}
 	// Generate from the ORIGINAL question (not the English translation): the
 	// translation is only for retrieval (matching the English docs). Passing the

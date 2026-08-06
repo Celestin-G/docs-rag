@@ -22,7 +22,7 @@ Use this for any question about how Formance works: Ledger and Numscript, API en
 
 The answer is grounded exclusively in the documentation and carries [n] citation markers matching the returned sources. Relay it verbatim: do not reword, summarise, extend or correct it, and keep the source links. If the answer is incomplete, say so explicitly rather than filling the gap from your own knowledge.
 
-Set license to "community" whenever the customer is on Community edition — the answer then flags Enterprise-only features instead of presenting them as available. Ask a full question rather than keywords; the retrieval is semantic, not lexical.`
+Set license to "community" whenever the customer is on Community edition — the answer then flags Enterprise-only features instead of presenting them as available. Set sdk when the customer works in a known language, so examples come back in it rather than mixed. Ask a full question rather than keywords; the retrieval is semantic, not lexical.`
 
 // askDocsInput is the tool's parameter schema. Each jsonschema tag is the
 // description the model sees for that argument.
@@ -31,6 +31,8 @@ type askDocsInput struct {
 	Version    string `json:"version,omitempty" jsonschema:"Formance Stack version to restrict the documentation to, e.g. 3.2; omit when unknown"`
 	Deployment string `json:"deployment,omitempty" jsonschema:"deployment model: cloud, self-hosted or both; omit when unknown"`
 	License    string `json:"license,omitempty" jsonschema:"customer license: ee for Enterprise or community; set it whenever known so Enterprise-only features are flagged correctly"`
+	Numscript  string `json:"numscript,omitempty" jsonschema:"Numscript interpreter in use: new or legacy; experimental language features exist only on the new interpreter"`
+	SDK        string `json:"sdk,omitempty" jsonschema:"SDK the customer uses: typescript, go, python, java, csharp or php; set it to get examples in their language instead of a mix"`
 }
 
 // docSource is one cited documentation page.
@@ -63,6 +65,8 @@ func (s *srv) askDocs(ctx context.Context, _ *mcp.CallToolRequest, in askDocsInp
 		Version:    in.Version,
 		Deployment: in.Deployment,
 		License:    in.License,
+		Numscript:  in.Numscript,
+		SDK:        in.SDK,
 	}
 	req.normalise()
 
@@ -98,7 +102,7 @@ func (s *srv) askDocs(ctx context.Context, _ *mcp.CallToolRequest, in askDocsInp
 			Citation: i + 1, // the prompt numbers excerpts [1], [2], … in this order
 			File:     src.File,
 			Section:  src.Section,
-			URL:      sourceURL(src.File),
+			URL:      src.URL,
 		}
 	}
 	return nil, out, nil
