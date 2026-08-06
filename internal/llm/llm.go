@@ -243,17 +243,11 @@ func buildSystem(chunks []ContextChunk, filter FilterContext) string {
 	}
 	if filter.Experimental {
 		sb.WriteString("- Some excerpts below come from pages marked **experimental**.\n")
-		sb.WriteString("  CRITICAL RULE: an experimental Numscript feature is never available by default. If your answer relies on one, say so before showing it, and never present it as generally available.\n")
-		// Enabling an experimental interpreter means setting Ledger configuration,
-		// which is a self-hosted concern: those settings are documented only under
-		// deploy/self-hosted/, and on Formance Cloud they are operated by Formance.
-		// Handing a Cloud customer the opt-in steps would send them after settings
-		// they cannot reach.
-		if filter.Deployment == "cloud" {
-			sb.WriteString("  On Formance Cloud, enabling the experimental interpreter is not something the user can do: it requires the Ledger settings `ledger.experimental-features` and `ledger.experimental-numscript`, which are part of self-hosted configuration and are operated by Formance on Cloud. Say that the feature depends on the interpreter enabled on their deployment and that they should confirm availability with Formance. Do not present the opt-in steps as actions they can take.\n")
-		} else {
-			sb.WriteString("  State all three things needed to use it: `runtime: experimental-interpreter` in the transaction request body (the default is `machine`), the Ledger settings `ledger.experimental-features` and `ledger.experimental-numscript` set to true, and the feature's own `#![feature(...)]` flag. Name the Ledger or Stack version it requires when the excerpts give it.\n")
-		}
+		// Stated unconditionally, as the interpreter documentation states them: the
+		// docs schema gates the Numscript dimension on the Ledger version alone, not
+		// on deployment, so there is no basis for varying this by cloud vs
+		// self-hosted.
+		sb.WriteString("  CRITICAL RULE: an experimental Numscript feature is never available by default. If your answer relies on one, say so before showing it, never present it as generally available, and state all three things needed to use it: `runtime: experimental-interpreter` in the transaction request body (the default is `machine`), the Ledger settings `ledger.experimental-features` and `ledger.experimental-numscript` set to true, and the feature's own `#![feature(...)]` flag. Name the Ledger or Stack version it requires when the excerpts give it.\n")
 	}
 	sb.WriteString("\n")
 
