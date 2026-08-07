@@ -310,9 +310,22 @@ func isDocFile(rel string) bool {
 	if strings.HasSuffix(rel, ".json") {
 		return strings.HasPrefix(rel, "apps/docs/content/data/generated/")
 	}
-	// Keep everything under apps/docs/content/ (pages + fragments)
-	if strings.HasPrefix(rel, "apps/docs/content/") {
-		return true
+	// Named directories rather than all of apps/docs/content/. That directory
+	// also holds authoring templates and internal worklists, which are not
+	// published — and an allowlist means the next thing filed there stays out by
+	// default instead of quietly joining the index.
+	//
+	// Found through the version picker: the only page claiming stack 3.3 was
+	// connector-page.template.mdx, a blank template carrying 3.3 as an example
+	// value in its frontmatter. It invented a version that does not exist, and
+	// its boilerplate competed with real pages on connector questions.
+	for _, dir := range []string{
+		"apps/docs/content/pages/",     // the published documentation
+		"apps/docs/content/fragments/", // partials the pages include
+	} {
+		if strings.HasPrefix(rel, dir) {
+			return true
+		}
 	}
 	// Keep the numscript engine README which has useful technical content
 	if strings.HasPrefix(rel, "packages/numscript-engine/") {
