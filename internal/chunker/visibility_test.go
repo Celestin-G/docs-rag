@@ -57,3 +57,40 @@ func TestParseFileCarriesVisibilityToChunks(t *testing.T) {
 		}
 	}
 }
+
+// The deployment column was inferred from the file path, which only catches
+// pages filed under deploy/. Self-hosted-only material lives all over the tree,
+// and those pages reached Cloud readers unfiltered.
+func TestVisibilityDeploymentOverridesThePath(t *testing.T) {
+	for name, tc := range map[string]struct {
+		path string
+		vis  string
+		want string
+	}{
+		"frontmatter states self-hosted outside deploy/": {
+			"apps/docs/content/pages/operate/backups.mdx", `deployment: "self-hosted"`, "self-hosted"},
+		"frontmatter states cloud": {
+			"apps/docs/content/pages/operate/regions.mdx", `deployment: "cloud"`, "cloud"},
+		"frontmatter agrees with the path": {
+			"apps/docs/content/pages/deploy/self-hosted/demo.mdx", `deployment: "self-hosted"`, "self-hosted"},
+		"both values listed is no constraint": {
+			"apps/docs/content/pages/operate/x.mdx", `deployment: ["cloud", "self-hosted"]`, "both"},
+		"another dimension leaves deployment alone": {
+			"apps/docs/content/pages/operate/y.mdx", `numscript: "new"`, "both"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fm := "---\ntitle: \"T\"\nvisibility: { " + tc.vis + " }\n---\n\nBody.\n"
+			if got := parseMeta(tc.path, []byte(fm)).deployment; got != tc.want {
+				t.Errorf("deployment = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The path stays authoritative when the frontmatter says nothing.
+func TestPathStillSetsDeploymentWithoutVisibility(t *testing.T) {
+	fm := "---\ntitle: \"T\"\n---\n\nBody.\n"
+	if got := parseMeta("apps/docs/content/pages/deploy/cloud/start.mdx", []byte(fm)).deployment; got != "cloud" {
+		t.Errorf("deployment = %q, want cloud", got)
+	}
+}

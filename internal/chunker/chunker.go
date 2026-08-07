@@ -185,8 +185,32 @@ func parseMeta(relPath string, raw []byte) pageMeta {
 	}
 	if g := visibilityRe.FindStringSubmatch(fm); len(g) > 1 {
 		m.visibility = parseVisibility(g[1])
+		// A declared deployment wins over the one guessed from the path above.
+		// Guessing from the directory only catches pages filed under deploy/, and
+		// self-hosted-only material lives all over the tree — 23 chunks in the
+		// current corpus said self-hosted in their frontmatter while their path
+		// said nothing, so they reached Cloud readers. The frontmatter is the
+		// statement of intent; the path is an inference.
+		if d := deploymentFromVisibility(m.visibility["deployment"]); d != "" {
+			m.deployment = d
+		}
 	}
 	return m
+}
+
+// deploymentFromVisibility collapses a visibility list onto the single value the
+// deployment column holds. Returns "" when the list says nothing useful, leaving
+// whatever the path inferred in place.
+func deploymentFromVisibility(allowed []string) string {
+	if len(allowed) != 1 {
+		// Empty, or both values listed: no constraint either way.
+		return ""
+	}
+	switch allowed[0] {
+	case "cloud", "self-hosted":
+		return allowed[0]
+	}
+	return ""
 }
 
 // parseVisibility reads the body of a `visibility: { ... }` frontmatter entry.
