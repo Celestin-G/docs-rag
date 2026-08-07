@@ -14,6 +14,10 @@ import (
 // Store handles all PostgreSQL interactions for doc chunks.
 type Store struct {
 	pool *pgxpool.Pool
+	// target is where Insert writes: the live table normally, the staging table
+	// during a full re-ingest. Reads always go to the live table — a staged
+	// index is not servable until it is complete. See staging.go.
+	target string
 }
 
 // New creates a Store connected to the given DSN.
@@ -26,7 +30,7 @@ func New(ctx context.Context, dsn string) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
-	return &Store{pool: pool}, nil
+	return &Store{pool: pool, target: chunksTable}, nil
 }
 
 // Close releases the connection pool.
@@ -85,7 +89,7 @@ func (s *Store) Insert(ctx context.Context, chunk DocChunk, badge string, versio
 		vis = string(b)
 	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO doc_chunks (source_file, section, content, embedding, content_tsv, badge, version_num, version_below, version_component, deployment, visibility)
+		`INSERT INTO `+s.target+` (source_file, section, content, embedding, content_tsv, badge, version_num, version_below, version_component, deployment, visibility)
 		 VALUES ($1, $2, $3, $4::vector,
 		         to_tsvector('english', coalesce($2, '') || ' ' || $3),
 		         $5, $6, $7, $8, $9, $10)`,
@@ -387,12 +391,6 @@ func (s *Store) GetStats(ctx context.Context) (Stats, error) {
 		return st, fmt.Errorf("stats feedback: %w", err)
 	}
 	return st, nil
-}
-
-// Truncate removes all chunks from the table.
-func (s *Store) Truncate(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, "TRUNCATE doc_chunks")
-	return err
 }
 
 // Exec runs an arbitrary SQL statement (used for migrations).

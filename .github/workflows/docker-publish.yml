@@ -39,6 +39,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          # arm64 as well as amd64: the cluster runs Graviton nodes, and a
+          # single-arch image forces every pod that uses it onto a nodeSelector.
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

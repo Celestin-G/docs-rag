@@ -26,7 +26,13 @@ const (
 
 // sourceURL returns the public documentation URL for a source file, or "" when
 // the file is not a standalone page.
-func sourceURL(file string) string {
+//
+// The section, when it is a heading, becomes an anchor. Pages here run long —
+// the answer often rests on one heading out of twenty — so landing on the page
+// and leaving the reader to find the passage wastes most of what a citation is
+// for. A wrong anchor is a cheap failure: the browser ignores it and shows the
+// top of the page, exactly what we had before.
+func sourceURL(file, section string) string {
 	if !strings.HasPrefix(file, docsPagesPrefix) {
 		return ""
 	}
@@ -37,7 +43,40 @@ func sourceURL(file string) string {
 	if p == "" {
 		return ""
 	}
+	if a := anchor(section); a != "" {
+		return docsBaseURL + p + "#" + a
+	}
 	return docsBaseURL + p
+}
+
+// anchor slugifies a heading the way the docs site generates its heading ids:
+// lowercased, punctuation dropped, spaces joined with hyphens.
+//
+// Returns "" for a section that is not a heading. Generated datasets label
+// their chunks "api.operations › v2CreateLedger", which is an identifier rather
+// than something the page renders — and those files have no public URL anyway,
+// so this is belt and braces.
+func anchor(section string) string {
+	if section == "" || strings.Contains(section, "›") {
+		return ""
+	}
+	var b strings.Builder
+	lastHyphen := true // suppress a leading hyphen
+	for _, r := range strings.ToLower(section) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastHyphen = false
+		case r == ' ' || r == '-' || r == '_':
+			if !lastHyphen {
+				b.WriteByte('-')
+				lastHyphen = true
+			}
+		}
+		// Everything else — backticks, brackets, accents, punctuation — is dropped,
+		// which is what the site's own slugifier does.
+	}
+	return strings.TrimSuffix(b.String(), "-")
 }
 
 // renderSources formats a citation list to append to a generated answer.
@@ -63,7 +102,7 @@ func renderSources(sources []source) string {
 		}
 		// Derived from the path rather than read from s.URL: pure and independent
 		// of whether the caller populated that field.
-		if u := sourceURL(s.File); u != "" {
+		if u := sourceURL(s.File, s.Section); u != "" {
 			b.WriteString(u)
 		} else {
 			// Fragments have no standalone page; the repo path is all we can cite.
@@ -158,7 +197,7 @@ func (s *srv) answer(ctx context.Context, req askReq, out io.Writer) (answerResu
 	sources := make([]source, len(chunks))
 	for i, c := range chunks {
 		ctxChunks[i] = llm.ContextChunk{SourceFile: c.SourceFile, Section: c.Section, Content: c.Content}
-		sources[i] = source{File: c.SourceFile, Section: c.Section, URL: sourceURL(c.SourceFile)}
+		sources[i] = source{File: c.SourceFile, Section: c.Section, URL: sourceURL(c.SourceFile, c.Section)}
 	}
 
 	filterCtx := llm.FilterContext{License: req.License, Deployment: req.Deployment, Version: req.Version}

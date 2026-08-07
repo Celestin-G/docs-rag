@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,7 +23,7 @@ var ingestCmd = &cobra.Command{
 }
 
 func init() {
-	ingestCmd.Flags().Bool("clean", false, "Truncate existing data before ingesting")
+	ingestCmd.Flags().Bool("clean", false, "Rebuild the whole index: fill a staging table and swap it in when complete")
 	ingestCmd.Flags().Bool("dry-run", false, "Parse every file and report what would be ingested, without embedding or writing")
 	rootCmd.AddCommand(ingestCmd)
 }
@@ -36,9 +37,9 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 	dry, _ := cmd.Flags().GetBool("dry-run")
 
 	// A dry run touches nothing outside this process: no database, no embedder,
-	// no DATABASE_URL required. That is the point — a real run truncates before
-	// it refills, so a parser that dies halfway leaves the index empty until
-	// someone notices. This exercises the parsing on the real corpus first.
+	// no DATABASE_URL required. It exists to exercise the parsing on the real
+	// corpus before a run that costs half an hour of embedding, and to name
+	// every file it would silently drop.
 	var st *store.Store
 	var emb *embedder.Embedder
 	if !dry {
@@ -49,11 +50,21 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 		defer st2.Close()
 		st = st2
 
+		// A full re-ingest builds a staging table and swaps it in at the end, so
+		// the live index keeps answering for the whole run and a failure leaves it
+		// exactly as it was. See internal/store/staging.go.
 		if clean {
-			fmt.Fprintln(os.Stderr, "Truncating existing data...")
-			if err := st.Truncate(ctx); err != nil {
-				return fmt.Errorf("truncate: %w", err)
+			fmt.Fprintln(os.Stderr, "Building a fresh index alongside the live one...")
+			if err := st.StageCreate(ctx); err != nil {
+				return err
 			}
+			defer func() {
+				// No-op once the swap has happened; drops a half-filled table when
+				// the run died before it.
+				if err := st.StageDiscard(context.Background()); err != nil {
+					log.Printf("discard staging table: %v", err)
+				}
+			}()
 		}
 		emb = embedder.New()
 	}
@@ -142,6 +153,14 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 	if dry {
 		return report.print(os.Stderr, len(files))
 	}
+
+	if clean {
+		fmt.Fprintf(os.Stderr, "\nIndexing %d chunks and swapping them in...\n", totalChunks)
+		if err := st.StagePromote(ctx); err != nil {
+			return err
+		}
+	}
+
 	fmt.Fprintf(os.Stderr, "\nDone — ingested %d chunks from %d files.\n", totalChunks, len(files))
 	return nil
 }

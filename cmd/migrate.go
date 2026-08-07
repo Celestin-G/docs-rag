@@ -32,39 +32,9 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- scoped, so it is released whatever happens below.
 SELECT pg_advisory_xact_lock(hashtext('docs_rag_migrate'));
 
-CREATE TABLE IF NOT EXISTS doc_chunks (
-  id          SERIAL PRIMARY KEY,
-  source_file TEXT NOT NULL,
-  section     TEXT,
-  content     TEXT NOT NULL,
-  embedding   vector(768),
-  content_tsv TSVECTOR,
-  badge       TEXT,
-  -- version_num is the lower bound: the stack version this content appears in.
-  -- version_below is the exclusive upper bound, NULL when the content still
-  -- applies to the latest version. The pair mirrors the docs framework's
-  -- version-composition ranges ({min: "v3.0", below: "v3.1"}), which a single
-  -- lower bound cannot express — without it, v3.0 API operations surface for a
-  -- question scoped to v3.2.
-  version_num   SMALLINT,
-  version_below SMALLINT,
-  -- Which component the version bounds are expressed against. Pages declare it
-  -- in frontmatter as "component: numscript-interpreter" and default to the
-  -- stack. Without it a ledger "2.3" constraint reads as stack v2.3 and a
-  -- "0.0.15" interpreter constraint collapses to zero, so both stop filtering
-  -- anything. Only stack-scoped bounds are compared against the stack version
-  -- the user selects; the rest are stored for the per-component cascade, which
-  -- needs the framework's composition graph to be machine-readable first.
-  version_component TEXT NOT NULL DEFAULT 'stack',
-  -- Which dimension values the page applies to, e.g. {"numscript": ["new"]}.
-  -- This is how the docs hide experimental features: a page carrying
-  -- visibility.numscript = new does not exist when the Legacy Machine is
-  -- selected. Distinct from the version bounds above — a page can be gated on a
-  -- dimension without any version constraint, and the reverse.
-  visibility JSONB,
-  deployment  TEXT NOT NULL DEFAULT 'both',
-  created_at  TIMESTAMPTZ DEFAULT NOW()
-);
+-- The table body itself lives in internal/store, next to the staging table a
+-- re-ingest swaps in, so the two cannot drift apart.
+%s
 
 -- Columns added after the table first shipped. The CREATE above already lists
 -- them for a fresh database; these bring an existing one to the same shape.
@@ -123,7 +93,7 @@ func runMigrate(_ *cobra.Command, _ []string) error {
 	}
 	defer st.Close()
 
-	if err := st.Exec(ctx, migrationSQL); err != nil {
+	if err := st.Exec(ctx, fmt.Sprintf(migrationSQL, store.ChunkTableDDL("doc_chunks", true))); err != nil {
 		return fmt.Errorf("apply migration: %w", err)
 	}
 
