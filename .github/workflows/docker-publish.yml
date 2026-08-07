@@ -32,6 +32,12 @@ jobs:
             type=sha,format=long
             type=raw,value=latest
 
+      # The Go build is cross-compiled and needs no emulation, but the final
+      # stage still runs apk on the target architecture. Without binfmt
+      # registered, the arm64 half of the build fails outright.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -39,6 +45,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          # arm64 as well as amd64: the cluster runs Graviton nodes, and a
+          # single-arch image forces every pod that uses it onto a nodeSelector.
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
