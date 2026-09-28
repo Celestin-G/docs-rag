@@ -10,5 +10,25 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
+  # test-db is a separate, throwaway instance for internal/store's tests.
+  # Point TEST_DATABASE_URL at it (never DATABASE_URL — that's the postgres
+  # service above, which store tests must never touch):
+  #
+  #   TEST_DATABASE_URL=postgres://rag:rag@localhost:5433/ragdb go test ./internal/store/...
+  #
+  # tmpfs data means a restart starts empty; each test also creates its own
+  # random schema and drops it afterwards (see internal/store/testdb_test.go),
+  # so nothing here needs to persist between runs.
+  test-db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: ragdb
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+
 volumes:
   pgdata:
