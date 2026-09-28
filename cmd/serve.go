@@ -36,7 +36,10 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	}
 	defer st.Close()
 
-	handler := server.New(st, embedder.New(), llm.New())
+	handler, err := server.New(st, embedder.New(), llm.New())
+	if err != nil {
+		return fmt.Errorf("configure server: %w", err)
+	}
 
 	srv := &http.Server{
 		Addr:    addr,

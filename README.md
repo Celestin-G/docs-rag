@@ -106,10 +106,14 @@ Then open **http://localhost:8080**.
 
 Two independent rate-limiting layers (defence in depth):
 
-- **Go middleware** — 5 req/min per IP (burst 3) on `POST /api/ask` and `POST /api/feedback`, honouring `X-Forwarded-For`/`X-Real-IP` behind a proxy. Stale per-IP entries are garbage-collected automatically. Exceeding the limit returns `429` with a friendly message in the UI.
-- **nginx** (production) — same limit enforced at the network edge before requests reach the app (see below).
+- **Go middleware** — 5 req/min per IP (burst 3) on `POST /api/ask` and `POST /api/feedback`; MCP tool calls get their own, separate budget (20/min, burst 5) so agent traffic and browser traffic never share a bucket. Both honour `X-Forwarded-For`/`X-Real-IP`, but only from a trusted proxy — see `TRUSTED_PROXIES` below. Stale per-IP entries are garbage-collected automatically. Exceeding the limit returns `429` with a friendly message in the UI (or a plain `429` JSON response for MCP).
+- **nginx** (production) — same `/api/ask` limit enforced at the network edge before requests reach the app (see below).
 
 Input hardening on `/api/ask`: request body capped at 256 KB, question at 2 000 characters, history at the last 12 turns, `top_k` at 30. The system prompt also instructs the model to treat the user question as data, not instructions (prompt-injection mitigation).
+
+**MCP endpoint** (`/api/mcp`) — authentication is optional, controlled by `MCP_TOKEN`. When set, every request must carry `Authorization: Bearer <MCP_TOKEN>` (checked in constant time); missing or wrong tokens get `401` with a `WWW-Authenticate: Bearer` header, and the request never reaches the tool pipeline. When `MCP_TOKEN` is unset the endpoint stays open for backward compatibility, and the server logs a startup warning that it is unauthenticated. Either way, the endpoint is rate-limited (see above).
+
+**Trusted proxies** — `X-Forwarded-For` and `X-Real-IP` are only honoured when the request's `RemoteAddr` is itself a trusted proxy (`TRUSTED_PROXIES`, default `127.0.0.1/32,::1/128` — i.e. nginx on the same host). Otherwise those headers are client-controlled and would let anyone spoof their IP to dodge or pollute the rate limiter. When trusted, `X-Forwarded-For` is walked right-to-left to skip any trusted-proxy hops and find the address the proxy chain actually observed.
 
 ---
 
@@ -133,7 +137,7 @@ Both tables are created with `IF NOT EXISTS` and survive `migrate` runs (only `d
 
 ## Production deployment (nginx)
 
-For a customer-facing deployment, put nginx in front of the Go server. It handles rate limiting at the network edge, before requests reach the app, and passes the real client IP via `X-Real-IP` so the Go-level rate limiter also works correctly.
+For a customer-facing deployment, put nginx in front of the Go server. It handles rate limiting at the network edge, before requests reach the app, and passes the real client IP via `X-Real-IP` / `X-Forwarded-For` so the Go-level rate limiter also works correctly — every `location` block in `nginx.conf` that sets its own `proxy_set_header` repeats these, since nginx does not merge them in from the `server{}` block once a `location{}` sets its own.
 
 ```bash
 # Copy the provided config
@@ -146,10 +150,10 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Key settings in `nginx.conf`:
 - **Rate limit**: 5 req/min per IP, burst of 3 — applied only on `POST /api/ask`
-- **SSE streaming**: `proxy_buffering off` + `proxy_http_version 1.1` so tokens stream to the browser in real time
-- **Timeout**: `proxy_read_timeout 120s` — LLM generation can take 60s+, don't cut it short
+- **SSE streaming**: `proxy_buffering off` + `proxy_http_version 1.1` on both `/api/ask` and `/api/mcp` (the MCP streamable HTTP transport keeps a long-lived GET stream open the same way) so tokens/messages stream through in real time
+- **Timeout**: `proxy_read_timeout 120s` on `/api/ask` (LLM generation can take 60s+) and `600s` on `/api/mcp` (agent sessions can idle between tool calls) — don't cut either short
 
-The Go server also enforces the same 5 req/min limit independently (defence in depth). Set your domain in the `server_name` directive.
+The Go server also enforces its own rate limits independently (defence in depth): 5 req/min for `/api/ask`/`/api/feedback`, 20 req/min for `/api/mcp`. Set your domain in the `server_name` directive.
 
 ---
 
@@ -196,6 +200,8 @@ go run . ask "question"   Ask a question from the terminal (no UI)
 | `LLM_BASE_URL` | no | `http://localhost:11434/v1` | OpenAI-compatible base URL for **generation** (incl. `/v1`). Local Ollama by default; set to a LiteLLM gateway in prod |
 | `LLM_API_KEY` | no | — | Bearer token for `LLM_BASE_URL` (e.g. a LiteLLM key). Leave empty for keyless local Ollama |
 | `LLM_MODEL` | no | `qwen2.5:32b` | Generation model id — e.g. `qwen2.5:32b` (local) or `claude-opus-5` (LiteLLM) |
+| `TRUSTED_PROXIES` | no | `127.0.0.1/32,::1/128` | Comma-separated CIDRs allowed to set `X-Forwarded-For`/`X-Real-IP`. Invalid CIDRs fail server startup. |
+| `MCP_TOKEN` | no | — | Bearer token required on `/api/mcp` (`Authorization: Bearer <token>`). Left unset, the endpoint stays open and the server logs a startup warning. |
 
 > **Generation is OpenAI-compatible.** The same client talks to local Ollama (`/v1/chat/completions`) or a hosted LiteLLM gateway — switching provider/model is pure config (`LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL`), no code change. Embeddings stay on Ollama's `nomic-embed-text` regardless.
 

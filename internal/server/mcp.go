@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,6 +12,16 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// rateLimit for MCP tool calls: separate budget from /api/ask (see
+// server.go) — agent traffic must not starve, or be starved by, anonymous
+// browser traffic, and vice versa. 20/min with a burst of 5 is generous
+// enough for an interactive agent session while still bounding abuse of an
+// endpoint that, unlike /api/ask, may have no token configured at all.
+const (
+	mcpRatePerMinute = 20
+	mcpRateBurst     = 5
 )
 
 // askDocsDescription is what an agent reads to decide whether to call the tool
@@ -110,11 +122,14 @@ func (s *srv) askDocs(ctx context.Context, _ *mcp.CallToolRequest, in askDocsInp
 
 // mcpHandler serves the Model Context Protocol endpoint over streamable HTTP.
 //
-// Deliberately not wrapped in withRateLimit: that limiter exists to stop an
-// anonymous browser from hammering /api/ask, and it counts per client IP. Agent
-// traffic arrives from a single gateway address, so the 5-per-minute budget
-// would be shared across every user of that gateway. Access here is already
-// restricted upstream, by network policy and by the agent's own allowlist.
+// Not wrapped in the /api/ask rate limiter — that budget (5/min) is sized for
+// an anonymous browser, and agent traffic can legitimately arrive from a
+// single gateway address, so sharing it would starve every user of that
+// gateway on one bad actor. MCP gets its own, more generous limiter
+// (mcpRatePerMinute/mcpRateBurst) keyed by the same client IP, plus an
+// optional bearer token (MCP_TOKEN) since — unlike /api/ask, which only
+// answers questions — this endpoint is reachable by any agent that can send
+// HTTP requests, not just the bundled web UI.
 func (s *srv) mcpHandler() http.Handler {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "docs-rag",
@@ -124,5 +139,63 @@ func (s *srv) mcpHandler() http.Handler {
 		Name:        "ask_formance_docs",
 		Description: askDocsDescription,
 	}, s.askDocs)
-	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
+	h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
+	// Rate limit first, auth second: a limiter that only counted
+	// successfully-authenticated requests would let an attacker send
+	// unlimited wrong-token guesses. Bucketing on IP before checking the
+	// token closes that off.
+	return s.withMCPRateLimit(s.withMCPAuth(h))
+}
+
+// withMCPAuth requires `Authorization: Bearer <MCP_TOKEN>` when MCP_TOKEN is
+// configured, comparing in constant time to avoid a timing side-channel on
+// the token. When MCP_TOKEN is unset the endpoint stays open (backward
+// compatible with existing deployments) — New() logs a startup warning in
+// that case.
+func (s *srv) withMCPAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.mcpToken == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		const prefix = "Bearer "
+		token := ""
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, prefix) {
+			token = strings.TrimPrefix(auth, prefix)
+		}
+		if subtle.ConstantTimeCompare([]byte(token), []byte(s.mcpToken)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="docs-rag-mcp"`)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withMCPRateLimit enforces the per-IP MCP budget before any protocol work
+// happens.
+//
+// This limits at the HTTP layer (429, mirroring /api/ask) rather than as an
+// MCP-protocol tool error: mcp.NewStreamableHTTPHandler owns the JSON-RPC
+// framing for POST (tool calls), GET (the server-to-client stream) and
+// DELETE (session teardown), and none of that machinery is reachable from
+// here without forking or wrapping the SDK's internals. Rejecting the HTTP
+// request outright is also strictly cheaper: it does no JSON-RPC parsing or
+// pipeline work, and a compliant MCP client already treats a non-2xx HTTP
+// response as a failed call.
+func (s *srv) withMCPRateLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := s.clientIP(r)
+		if !s.mcpLimiter.allow(ip) {
+			log.Printf("MCP rate limit hit: %s", ip)
+			w.Header().Set("Retry-After", "60")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]string{"error": "too many requests"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

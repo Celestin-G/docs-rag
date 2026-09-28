@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,7 +20,10 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// rateLimit: 5 requests per minute per IP, burst of 3.
+// rateLimit: 5 requests per minute per IP, burst of 3, for /api/ask and
+// /api/feedback. MCP tool calls get their own, more generous budget (see
+// mcp.go) — agent traffic and anonymous browser traffic must not share a
+// bucket, or one starves the other.
 const (
 	ratePerMinute = 5
 	rateBurst     = 3
@@ -25,16 +31,63 @@ const (
 	expireAfter   = 10 * time.Minute
 )
 
+// defaultTrustedProxies matches the nginx-on-same-host deployment described
+// in nginx.conf: nginx is the only thing allowed to set X-Forwarded-For /
+// X-Real-IP for the Go app.
+const defaultTrustedProxies = "127.0.0.1/32,::1/128"
+
 type limitEntry struct {
 	limiter  *rate.Limiter
 	lastSeen atomic.Int64 // unix nano
 }
 
+// rateLimiter is a per-IP token-bucket limiter for one class of route.
+// Each route class (ask/feedback vs MCP) owns its own instance so a burst
+// on one never eats into the other's budget.
+type rateLimiter struct {
+	entries sync.Map // map[string]*limitEntry
+	every   time.Duration
+	burst   int
+}
+
+func newRateLimiter(perMinute, burst int) *rateLimiter {
+	return &rateLimiter{every: time.Minute / time.Duration(perMinute), burst: burst}
+}
+
+// allow reports whether ip may proceed, consuming one token if so.
+func (rl *rateLimiter) allow(ip string) bool {
+	e := &limitEntry{limiter: rate.NewLimiter(rate.Every(rl.every), rl.burst)}
+	if v, loaded := rl.entries.LoadOrStore(ip, e); loaded {
+		e = v.(*limitEntry)
+	}
+	e.lastSeen.Store(time.Now().UnixNano())
+	return e.limiter.Allow()
+}
+
+// cleanup removes entries not seen since cutoff (unix nano), to prevent
+// unbounded memory growth from one-off IPs.
+func (rl *rateLimiter) cleanup(cutoff int64) {
+	rl.entries.Range(func(k, v any) bool {
+		if v.(*limitEntry).lastSeen.Load() < cutoff {
+			rl.entries.Delete(k)
+		}
+		return true
+	})
+}
+
 type srv struct {
-	store    *store.Store
-	emb      *embedder.Embedder
-	llm      *llm.Client
-	limiters sync.Map // map[string]*limitEntry
+	store *store.Store
+	emb   *embedder.Embedder
+	llm   *llm.Client
+
+	askLimiter *rateLimiter
+	mcpLimiter *rateLimiter
+
+	// trustedProxies gates which RemoteAddr values may hand the app a client
+	// IP via X-Forwarded-For / X-Real-IP — see clientIP.
+	trustedProxies []netip.Prefix
+	// mcpToken, when non-empty, is required as a Bearer token on /api/mcp.
+	mcpToken string
 
 	eeMu        sync.Mutex
 	eeFeatures  []string
@@ -64,14 +117,35 @@ func (s *srv) enterpriseFeatures(ctx context.Context) []string {
 	return feats
 }
 
-// New wires up HTTP handlers and returns a ready handler.
-func New(st *store.Store, emb *embedder.Embedder, lm *llm.Client) http.Handler {
-	s := &srv{store: st, emb: emb, llm: lm}
+// New wires up HTTP handlers and returns a ready handler. Configuration is
+// sourced from the environment:
+//   - TRUSTED_PROXIES : comma-separated CIDRs allowed to set X-Forwarded-For /
+//     X-Real-IP (default "127.0.0.1/32,::1/128", matching nginx on the same host)
+//   - MCP_TOKEN        : optional Bearer token required on /api/mcp
+func New(st *store.Store, emb *embedder.Embedder, lm *llm.Client) (http.Handler, error) {
+	trustedProxies, err := parseTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
+	if err != nil {
+		return nil, fmt.Errorf("parse TRUSTED_PROXIES: %w", err)
+	}
+	mcpToken := os.Getenv("MCP_TOKEN")
+	if mcpToken == "" {
+		log.Printf("WARNING: MCP_TOKEN is not set — /api/mcp is unauthenticated")
+	}
+
+	s := &srv{
+		store:          st,
+		emb:            emb,
+		llm:            lm,
+		askLimiter:     newRateLimiter(ratePerMinute, rateBurst),
+		mcpLimiter:     newRateLimiter(mcpRatePerMinute, mcpRateBurst),
+		trustedProxies: trustedProxies,
+		mcpToken:       mcpToken,
+	}
 	go s.cleanupLimiters()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.handleIndex)
-	mux.HandleFunc("POST /api/ask", s.withRateLimit(s.handleAsk))
-	mux.HandleFunc("POST /api/feedback", s.withRateLimit(s.handleFeedback))
+	mux.HandleFunc("POST /api/ask", s.withRateLimit(s.askLimiter, s.handleAsk))
+	mux.HandleFunc("POST /api/feedback", s.withRateLimit(s.askLimiter, s.handleFeedback))
 	mux.HandleFunc("GET /api/stats", s.handleStatsJSON)
 	mux.HandleFunc("GET /stats", s.handleStatsPage)
 	// MCP endpoint for agents. The streamable HTTP transport uses POST for calls,
@@ -82,41 +156,102 @@ func New(st *store.Store, emb *embedder.Embedder, lm *llm.Client) http.Handler {
 	mux.Handle("POST /api/mcp", mcpHandler)
 	mux.Handle("GET /api/mcp", mcpHandler)
 	mux.Handle("DELETE /api/mcp", mcpHandler)
-	return mux
+	return mux, nil
 }
 
-// clientIP extracts the real client IP, honouring X-Forwarded-For when present.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.Index(xff, ","); i >= 0 {
-			return strings.TrimSpace(xff[:i])
+// parseTrustedProxies parses a comma-separated CIDR list. An empty string
+// yields defaultTrustedProxies. Any invalid entry is a startup error — a
+// silently-ignored typo here would mean the app trusts client-controlled
+// headers from an unintended source.
+func parseTrustedProxies(raw string) ([]netip.Prefix, error) {
+	if strings.TrimSpace(raw) == "" {
+		raw = defaultTrustedProxies
+	}
+	parts := strings.Split(raw, ",")
+	prefixes := make([]netip.Prefix, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
 		}
-		return strings.TrimSpace(xff)
+		prefix, err := netip.ParsePrefix(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q: %w", p, err)
+		}
+		prefixes = append(prefixes, prefix)
 	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
+	return prefixes, nil
+}
+
+// clientIP extracts the real client IP. X-Forwarded-For / X-Real-IP are only
+// honoured when r.RemoteAddr belongs to a trusted proxy (see
+// parseTrustedProxies); otherwise any client could set those headers itself
+// to spoof its IP, evading its own rate limit or exhausting someone else's.
+//
+// When trusted, X-Forwarded-For is walked right-to-left: nginx appends the
+// address it actually observed to the end of the header
+// ($proxy_add_x_forwarded_for), so the rightmost entries are hops a trusted
+// proxy vouched for, while the leftmost entries are whatever the original
+// client claimed. The first entry (from the right) that is not itself a
+// trusted proxy is the real client.
+func clientIP(r *http.Request, trustedProxies []netip.Prefix) string {
+	remoteHost := hostOnly(r.RemoteAddr)
+	remoteAddr, err := netip.ParseAddr(remoteHost)
+	if err != nil || !addrTrusted(remoteAddr.Unmap(), trustedProxies) {
+		return remoteHost
 	}
-	// Strip port from RemoteAddr.
-	addr := r.RemoteAddr
-	if i := strings.LastIndex(addr, ":"); i >= 0 {
-		return addr[:i]
+
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			candidate := strings.TrimSpace(parts[i])
+			addr, err := netip.ParseAddr(candidate)
+			if err != nil {
+				continue
+			}
+			unmappedAddr := addr.Unmap()
+			if !addrTrusted(unmappedAddr, trustedProxies) {
+				return unmappedAddr.String()
+			}
+		}
+	}
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		addr, err := netip.ParseAddr(xri)
+		if err == nil {
+			return addr.Unmap().String()
+		}
+		// If X-Real-IP is invalid, fall back to RemoteAddr
+		return remoteHost
+	}
+	return remoteHost
+}
+
+// hostOnly strips the port from a host:port address, tolerating both IPv4
+// and bracketed IPv6 forms, and bare addresses with no port at all.
+func hostOnly(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
 	}
 	return addr
 }
 
-func (s *srv) getLimiter(ip string) *rate.Limiter {
-	e := &limitEntry{limiter: rate.NewLimiter(rate.Every(time.Minute/ratePerMinute), rateBurst)}
-	if v, loaded := s.limiters.LoadOrStore(ip, e); loaded {
-		e = v.(*limitEntry)
+func addrTrusted(addr netip.Addr, proxies []netip.Prefix) bool {
+	for _, p := range proxies {
+		if p.Contains(addr) {
+			return true
+		}
 	}
-	e.lastSeen.Store(time.Now().UnixNano())
-	return e.limiter
+	return false
 }
 
-func (s *srv) withRateLimit(next http.HandlerFunc) http.HandlerFunc {
+func (s *srv) clientIP(r *http.Request) string {
+	return clientIP(r, s.trustedProxies)
+}
+
+func (s *srv) withRateLimit(rl *rateLimiter, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip := clientIP(r)
-		if !s.getLimiter(ip).Allow() {
+		ip := s.clientIP(r)
+		if !rl.allow(ip) {
 			log.Printf("rate limit hit: %s", ip)
 			w.Header().Set("Retry-After", "60")
 			http.Error(w, "Too many requests — please wait a moment before asking again.", http.StatusTooManyRequests)
@@ -132,12 +267,8 @@ func (s *srv) cleanupLimiters() {
 	defer ticker.Stop()
 	for range ticker.C {
 		cutoff := time.Now().Add(-expireAfter).UnixNano()
-		s.limiters.Range(func(k, v any) bool {
-			if v.(*limitEntry).lastSeen.Load() < cutoff {
-				s.limiters.Delete(k)
-			}
-			return true
-		})
+		s.askLimiter.cleanup(cutoff)
+		s.mcpLimiter.cleanup(cutoff)
 	}
 }
 
