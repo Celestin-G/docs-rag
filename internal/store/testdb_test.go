@@ -7,17 +7,14 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
+	"strings"
 	"testing"
 )
 
 // testDSN returns TEST_DATABASE_URL, skipping the test when it is unset.
-//
-// Store tests must never read DATABASE_URL. The README has developers export
-// that in their shell for everyday use, and staging_test.go in particular
-// used to run DROP TABLE ... CASCADE against whatever database it was given
-// — reading DATABASE_URL here turned a plain `go test ./...` into a way to
-// wipe the real dev index. TEST_DATABASE_URL is a separate, deliberate
-// opt-in; see the test-db service in docker-compose.yml.
+// Never read DATABASE_URL here — that would turn `go test ./...` into a way
+// to wipe a developer's real dev index.
 func testDSN(t *testing.T) string {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
@@ -28,20 +25,11 @@ func testDSN(t *testing.T) string {
 }
 
 // testStore connects to TEST_DATABASE_URL, creates a throwaway schema with a
-// random name and points every connection the returned Store's pool opens at
-// it via search_path, then creates the chunks table inside that schema. The
-// schema — and everything created in it during the test — is dropped in
-// t.Cleanup, so callers never need their own reset/teardown SQL.
-//
-// Isolation relies on store.go and staging.go never schema-qualifying a
-// table name (always "doc_chunks", never "public.doc_chunks" — verified by
-// reading both files): putting the throwaway schema first on search_path is
-// therefore enough to keep every statement the Store issues confined to it.
-// public stays second on the path so the pgvector "vector" type — an
-// extension type, necessarily database-wide rather than per-schema — still
-// resolves. Nothing in this package other than the bootstrap step below ever
-// touches public, so a pre-existing public.doc_chunks row is never read,
-// written, or dropped by these tests.
+// random name, points every connection the returned Store's pool opens at it
+// via search_path, then creates the chunks table inside it. Everything
+// created is dropped in t.Cleanup. Isolation relies on store.go/staging.go
+// never schema-qualifying a table name; public stays second on the path so
+// pgvector's database-wide "vector" type still resolves.
 func testStore(t *testing.T) *Store {
 	t.Helper()
 	dsn := testDSN(t)
@@ -49,10 +37,9 @@ func testStore(t *testing.T) *Store {
 
 	schema := randomSchemaName(t)
 
-	// Bootstrap on the plain DSN (default search_path, i.e. public): the
-	// extension belongs in public regardless of which schema the test
-	// itself targets, and the throwaway schema doesn't exist yet for
-	// anything to have pointed at it.
+	// Bootstrap on the plain DSN (default search_path): the extension
+	// belongs in public regardless of the test's schema, which doesn't
+	// exist yet for anything to have pointed at it.
 	boot, err := New(ctx, dsn)
 	if err != nil {
 		t.Fatalf("connect (bootstrap): %v", err)
@@ -96,10 +83,12 @@ func testStore(t *testing.T) *Store {
 	return s
 }
 
-// randomSchemaName generates a name of the form rag_test_<16 hex chars>:
-// short enough to stay well under Postgres's 63-byte identifier limit, and
-// restricted to [a-f0-9] so it is always a safe unquoted identifier to
-// interpolate into CREATE/DROP SCHEMA statements.
+// schemaNameRE is the contract randomSchemaName promises: short enough for
+// Postgres's 63-byte identifier limit, and restricted to [a-f0-9] so it is
+// always safe to interpolate unquoted into CREATE/DROP SCHEMA.
+var schemaNameRE = regexp.MustCompile(`^rag_test_[0-9a-f]{16}$`)
+
+// randomSchemaName generates a name matching schemaNameRE.
 func randomSchemaName(t *testing.T) string {
 	t.Helper()
 	var b [8]byte
@@ -109,15 +98,9 @@ func randomSchemaName(t *testing.T) string {
 	return "rag_test_" + hex.EncodeToString(b[:])
 }
 
-// withSearchPath returns dsn with its search_path query parameter set to
-// path. pgconn.ParseConfig passes any connection-string parameter it doesn't
-// specifically recognise straight into RuntimeParams, sent as a session
-// default when the connection starts up — search_path isn't one of libpq's
-// special keys, so this is enough to pin every connection pgxpool opens to
-// path without a per-connection AfterConnect hook.
-//
-// Only the postgres:// or postgresql:// URL form is supported; libpq
-// keyword/value DSNs (e.g. "host=localhost user=rag ...") are rejected with an error.
+// withSearchPath sets dsn's search_path query parameter to path, so every
+// connection pgxpool opens gets it as a session default. Only postgres:// /
+// postgresql:// URLs are supported; libpq keyword/value DSNs error out.
 func withSearchPath(t *testing.T, dsn, path string) (string, error) {
 	t.Helper()
 	u, err := url.Parse(dsn)
@@ -131,4 +114,94 @@ func withSearchPath(t *testing.T, dsn, path string) (string, error) {
 	q.Set("search_path", path)
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+// TestWithSearchPath covers withSearchPath's DSN-rewriting contract; it is a
+// pure function, so this runs even without TEST_DATABASE_URL.
+func TestWithSearchPath(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		in      string
+		wantErr bool
+		check   func(t *testing.T, out string)
+	}{
+		{
+			name: "preserves scheme, host, path and an existing query param",
+			in:   "postgres://rag:rag@localhost:5432/ragdb?sslmode=disable",
+			check: func(t *testing.T, out string) {
+				u, err := url.Parse(out)
+				if err != nil {
+					t.Fatalf("reparse %q: %v", out, err)
+				}
+				if u.Scheme != "postgres" || u.Host != "localhost:5432" || u.Path != "/ragdb" {
+					t.Errorf("scheme/host/path = %q/%q/%q, want postgres/localhost:5432//ragdb", u.Scheme, u.Host, u.Path)
+				}
+				if got := u.Query().Get("sslmode"); got != "disable" {
+					t.Errorf("sslmode = %q, want %q (existing params must survive)", got, "disable")
+				}
+				if got := u.Query().Get("search_path"); got != "rag_test_deadbeef,public" {
+					t.Errorf("search_path = %q, want %q", got, "rag_test_deadbeef,public")
+				}
+			},
+		},
+		{
+			name: "overwrites a pre-existing search_path instead of appending to it",
+			in:   "postgres://rag:rag@localhost:5432/ragdb?search_path=whatever_the_dev_had",
+			check: func(t *testing.T, out string) {
+				u, err := url.Parse(out)
+				if err != nil {
+					t.Fatalf("reparse %q: %v", out, err)
+				}
+				got := u.Query()["search_path"]
+				if len(got) != 1 || got[0] != "rag_test_deadbeef,public" {
+					t.Errorf("search_path = %v, want a single value %q (old value must not survive alongside it)",
+						got, "rag_test_deadbeef,public")
+				}
+			},
+		},
+		{
+			name:    "rejects a libpq keyword/value DSN",
+			in:      "host=localhost user=rag password=rag dbname=ragdb port=5433 sslmode=disable",
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := withSearchPath(t, tc.in, "rag_test_deadbeef,public")
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("withSearchPath(%q) = nil error, want one", tc.in)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("withSearchPath(%q): %v", tc.in, err)
+			}
+			tc.check(t, out)
+		})
+	}
+}
+
+// TestRandomSchemaNameFormat checks the name matches schemaNameRE: both the
+// DROP SCHEMA cleanup and "safe to interpolate unquoted" depend on it.
+func TestRandomSchemaNameFormat(t *testing.T) {
+	name := randomSchemaName(t)
+	if !schemaNameRE.MatchString(name) {
+		t.Errorf("schema name %q does not match %s", name, schemaNameRE)
+	}
+}
+
+// ChunkTableDDL must never schema-qualify its name, or putting the
+// throwaway schema first on search_path would not isolate it from public.
+func TestChunkTableDDLNeverSchemaQualifiesName(t *testing.T) {
+	for _, ifNotExists := range []bool{true, false} {
+		for _, name := range []string{chunksTable, stagingTable} {
+			ddl := ChunkTableDDL(name, ifNotExists)
+			if strings.Contains(ddl, "public") {
+				t.Errorf("ChunkTableDDL(%q, %v) mentions \"public\": %s", name, ifNotExists, ddl)
+			}
+			if !strings.Contains(ddl, "CREATE TABLE") {
+				t.Errorf("ChunkTableDDL(%q, %v) missing CREATE TABLE: %s", name, ifNotExists, ddl)
+			}
+		}
+	}
 }

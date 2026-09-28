@@ -27,6 +27,7 @@ func TestEnvDuration(t *testing.T) {
 		{name: "unitless number falls back to the default", env: "5", want: def},
 		{name: "negative duration falls back to the default", env: "-1s", want: def},
 		{name: "zero falls back to the default", env: "0s", want: def},
+		{name: "unitless zero falls back to the default", env: "0", want: def},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(key, tc.env)

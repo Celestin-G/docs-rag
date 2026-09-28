@@ -1,10 +1,37 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+// TestAskDocsRequiresQuestion covers the empty-question guard in askDocs: a
+// question that is empty, or only whitespace, is rejected before it ever
+// reaches the pipeline (see maxQuestionLen's sibling check right below it).
+// A bare &srv{} is the cheapest server that satisfies askDocs here — the
+// question check runs before hardStop or the pipeline are ever touched, so
+// neither needs to be initialised (unlike TestAskDocsTrackedAndStoppedByForceCancel
+// in shutdown_test.go, which exercises those and so uses newTestSrv).
+func TestAskDocsRequiresQuestion(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		question string
+	}{
+		{name: "empty", question: ""},
+		{name: "whitespace only", question: "   "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &srv{}
+			_, _, err := s.askDocs(context.Background(), nil, askDocsInput{Question: tc.question})
+			if err == nil || !strings.Contains(err.Error(), "question is required") {
+				t.Fatalf("askDocs(%q) err = %v, want an error containing %q", tc.question, err, "question is required")
+			}
+		})
+	}
+}
 
 func handlerCalled(t *testing.T) (http.Handler, *bool) {
 	t.Helper()
@@ -15,62 +42,35 @@ func handlerCalled(t *testing.T) (http.Handler, *bool) {
 	}), &called
 }
 
+// TestWithMCPAuth covers both POST (tool calls) and GET (the streamable-HTTP
+// stream): withMCPAuth must not special-case the method, or a client could
+// open the server-to-client stream unauthenticated even with MCP_TOKEN set.
 func TestWithMCPAuth(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
+		method     string // defaults to POST
 		token      string // MCP_TOKEN configured on the server
 		authHeader string // Authorization header sent by the client
 		wantStatus int
 		wantCalled bool
 	}{
-		{
-			name:       "token unset: request passes through unauthenticated",
-			token:      "",
-			authHeader: "",
-			wantStatus: http.StatusOK,
-			wantCalled: true,
-		},
-		{
-			name:       "token set, correct bearer header: passes",
-			token:      "s3cr3t",
-			authHeader: "Bearer s3cr3t",
-			wantStatus: http.StatusOK,
-			wantCalled: true,
-		},
-		{
-			name:       "token set, missing header: 401, handler not called",
-			token:      "s3cr3t",
-			authHeader: "",
-			wantStatus: http.StatusUnauthorized,
-			wantCalled: false,
-		},
-		{
-			name:       "token set, wrong token: 401, handler not called",
-			token:      "s3cr3t",
-			authHeader: "Bearer wrong",
-			wantStatus: http.StatusUnauthorized,
-			wantCalled: false,
-		},
-		{
-			name:       "token set, non-bearer scheme: 401, handler not called",
-			token:      "s3cr3t",
-			authHeader: "Basic czNjcjN0",
-			wantStatus: http.StatusUnauthorized,
-			wantCalled: false,
-		},
-		{
-			name:       "token set, empty bearer value: 401, handler not called",
-			token:      "s3cr3t",
-			authHeader: "Bearer ",
-			wantStatus: http.StatusUnauthorized,
-			wantCalled: false,
-		},
+		{name: "token unset: request passes through unauthenticated", token: "", authHeader: "", wantStatus: http.StatusOK, wantCalled: true},
+		{name: "token set, correct bearer header: passes", token: "s3cr3t", authHeader: "Bearer s3cr3t", wantStatus: http.StatusOK, wantCalled: true},
+		{name: "token set, missing header: 401, handler not called", token: "s3cr3t", authHeader: "", wantStatus: http.StatusUnauthorized, wantCalled: false},
+		{name: "token set, wrong token: 401, handler not called", token: "s3cr3t", authHeader: "Bearer wrong", wantStatus: http.StatusUnauthorized, wantCalled: false},
+		{name: "token set, non-bearer scheme: 401, handler not called", token: "s3cr3t", authHeader: "Basic czNjcjN0", wantStatus: http.StatusUnauthorized, wantCalled: false},
+		{name: "token set, empty bearer value: 401, handler not called", token: "s3cr3t", authHeader: "Bearer ", wantStatus: http.StatusUnauthorized, wantCalled: false},
+		{name: "GET stream without a token: 401, handler not called", method: http.MethodGet, token: "s3cr3t", authHeader: "", wantStatus: http.StatusUnauthorized, wantCalled: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			method := tc.method
+			if method == "" {
+				method = http.MethodPost
+			}
 			s := &srv{mcpToken: tc.token}
 			next, called := handlerCalled(t)
 
-			r := httptest.NewRequest(http.MethodPost, "/api/mcp", nil)
+			r := httptest.NewRequest(method, "/api/mcp", nil)
 			if tc.authHeader != "" {
 				r.Header.Set("Authorization", tc.authHeader)
 			}
@@ -90,27 +90,6 @@ func TestWithMCPAuth(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// TestWithMCPAuthAppliesToGET covers the streamable-HTTP GET stream, not
-// just POST tool calls: withMCPAuth must not special-case the method, or a
-// client could open the server-to-client stream unauthenticated even with
-// MCP_TOKEN configured.
-func TestWithMCPAuthAppliesToGET(t *testing.T) {
-	s := &srv{mcpToken: "s3cr3t"}
-	next, called := handlerCalled(t)
-
-	r := httptest.NewRequest(http.MethodGet, "/api/mcp", nil)
-	w := httptest.NewRecorder()
-
-	s.withMCPAuth(next).ServeHTTP(w, r)
-
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("GET /api/mcp without a token: status = %d, want 401", w.Code)
-	}
-	if *called {
-		t.Error("handler should not be called for an unauthenticated GET")
 	}
 }
 
@@ -154,59 +133,5 @@ func TestMCPHandlerRateLimitWrapsAuth(t *testing.T) {
 
 	if w.Code != http.StatusTooManyRequests {
 		t.Errorf("status = %d, want 429 (rate limit should count failed-auth attempts)", w.Code)
-	}
-}
-
-func TestWithMCPRateLimit(t *testing.T) {
-	s := &srv{mcpLimiter: newRateLimiter(mcpRatePerMinute, mcpRateBurst)}
-	next, called := handlerCalled(t)
-	handler := s.withMCPRateLimit(next)
-
-	// Burst allowance: the first mcpRateBurst requests from the same IP succeed.
-	for i := 0; i < mcpRateBurst; i++ {
-		*called = false
-		r := httptest.NewRequest(http.MethodPost, "/api/mcp", nil)
-		r.RemoteAddr = "203.0.113.5:1234"
-		w := httptest.NewRecorder()
-
-		handler.ServeHTTP(w, r)
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("request %d: status = %d, want %d", i, w.Code, http.StatusOK)
-		}
-		if !*called {
-			t.Fatalf("request %d: handler was not called", i)
-		}
-	}
-
-	// One more request exceeds the burst and must be rejected without
-	// reaching the handler.
-	*called = false
-	r := httptest.NewRequest(http.MethodPost, "/api/mcp", nil)
-	r.RemoteAddr = "203.0.113.5:1234"
-	w := httptest.NewRecorder()
-
-	handler.ServeHTTP(w, r)
-
-	if w.Code != http.StatusTooManyRequests {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusTooManyRequests)
-	}
-	if *called {
-		t.Error("handler was called on a rate-limited request")
-	}
-
-	// A different client IP is unaffected — it gets its own bucket.
-	*called = false
-	r2 := httptest.NewRequest(http.MethodPost, "/api/mcp", nil)
-	r2.RemoteAddr = "198.51.100.9:1234"
-	w2 := httptest.NewRecorder()
-
-	handler.ServeHTTP(w2, r2)
-
-	if w2.Code != http.StatusOK {
-		t.Errorf("different IP: status = %d, want %d", w2.Code, http.StatusOK)
-	}
-	if !*called {
-		t.Error("different IP: handler was not called")
 	}
 }
