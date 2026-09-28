@@ -1,0 +1,121 @@
+name: Test
+
+# Runs on every PR and on pushes to any branch other than main. Pushes to
+# main are NOT listed here: docker-publish.yml calls this workflow via
+# `workflow_call` for those, and build's `needs: test` gates the image push
+# on it. Without excluding main here, a push to main would trigger this
+# workflow twice — once directly, once via the reusable call from
+# docker-publish — running the whole suite (including the Postgres service
+# container) twice for the same commit.
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - main
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  # Only cancel in-flight runs for PRs: a push to main (arriving here only
+  # via workflow_call from docker-publish) must run to completion so the
+  # image build it gates isn't left waiting on a cancelled run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt'ed:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: rag
+          POSTGRES_PASSWORD: rag
+          POSTGRES_DB: ragdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U rag -d ragdb"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    env:
+      TEST_DATABASE_URL: postgres://rag:rag@localhost:5432/ragdb?sslmode=disable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage
+          path: coverage.out
+
+      # internal/store/staging_test.go and visibility_test.go skip outright
+      # when TEST_DATABASE_URL is unset (see testdb_test.go's testDSN
+      # helper), which would let a broken Postgres service go unnoticed while
+      # the job still reports green. Re-run just those tests verbosely and
+      # fail the build if any of them skipped.
+      #
+      # Matched by name, not by exact string: the DB-gated tests are
+      # TestStagingSwap, TestStagingRefusesToPromoteAnEmptyIndex,
+      # TestStagePromoteWithoutStageCreateFails,
+      # TestStageDiscardIsSafeWithoutStageCreate (staging_test.go) and
+      # TestVisibilityPredicate, TestVisibilityPredicateRejectsJSONNullScalar
+      # (visibility_test.go) — all call testStore(t)/testDSN(t). The regex
+      # 'Stage|Visibility' looks obvious but misses TestStagingSwap and
+      # TestStagingRefusesToPromoteAnEmptyIndex: "Staging" and "Stage" part
+      # ways at the 5th character (Stagi... vs Stage), so "Stage" is not a
+      # substring of "Staging". 'Stag|Visibility' is the common prefix of
+      # both spellings and matches all six without also matching the
+      # DB-independent, never-skipping tests in testdb_edge_test.go
+      # (TestWithSearchPath..., TestRandomSchemaName...,
+      # TestChunkTableDDL...).
+      - name: Fail if DB-gated store tests were skipped
+        run: |
+          set -euo pipefail
+          go test -count=1 -v -run 'Stag|Visibility' ./internal/store/... | tee "$RUNNER_TEMP/store-db-tests.log"
+          if grep -q -- '--- SKIP' "$RUNNER_TEMP/store-db-tests.log"; then
+            echo "::error::DB-gated store tests were skipped — the Postgres service container is not reachable via TEST_DATABASE_URL"
+            exit 1
+          fi
