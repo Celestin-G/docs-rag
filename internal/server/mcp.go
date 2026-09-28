@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -61,9 +62,33 @@ type askDocsOutput struct {
 	Sources []docSource `json:"sources" jsonschema:"sources cited in the answer, in citation order"`
 }
 
+// errShuttingDown is the tool error an MCP tool call gets once the server
+// has started draining handlers (see (*Server).WaitHandlers).
+var errShuttingDown = errors.New("server shutting down")
+
 // askDocs runs the same pipeline as the web UI, buffering the generated answer
 // instead of streaming it: MCP returns one result, not a stream.
+//
+// It registers itself in handlersWG (see WaitHandlers) and links ctx to
+// hardStop (see ForceCancel): the go-sdk hands it a context derived from the
+// session's initialize request with cancellation stripped, so neither the
+// POST's own context nor http.Server's BaseContext would ever stop it, and
+// the POST handler that carried it can return (connection force-closed)
+// while it is still running.
 func (s *srv) askDocs(ctx context.Context, _ *mcp.CallToolRequest, in askDocsInput) (*mcp.CallToolResult, askDocsOutput, error) {
+	if !s.enterHandler() {
+		// A returned error becomes an MCP tool error (IsError result), not a
+		// JSON-RPC protocol error.
+		return nil, askDocsOutput{}, errShuttingDown
+	}
+	defer s.handlersWG.Done()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if s.hardStop != nil { // nil only for a bare &srv{} built by a test
+		stop := context.AfterFunc(s.hardStop, cancel)
+		defer stop()
+	}
+
 	question := strings.TrimSpace(in.Question)
 	if question == "" {
 		return nil, askDocsOutput{}, fmt.Errorf("question is required")
@@ -86,15 +111,11 @@ func (s *srv) askDocs(ctx context.Context, _ *mcp.CallToolRequest, in askDocsInp
 	var buf bytes.Buffer
 	res, err := s.answer(ctx, req, &buf)
 
-	// Log MCP traffic alongside web traffic so /api/stats covers both.
-	go func() {
-		if err := s.store.InsertRequestLog(
-			context.Background(), question,
-			int(time.Since(start).Milliseconds()), len(res.Sources), res.Status,
-		); err != nil {
-			log.Printf("request log insert: %v", err)
-		}
-	}()
+	// Log MCP traffic alongside web traffic so /api/stats covers both. See
+	// (*srv).logRequest for why this is tracked by logWG and runs on its own
+	// short-lived context rather than ctx, and requestLogStatus for why a
+	// disconnected agent is "cancelled" rather than "error".
+	s.logRequest(question, int(time.Since(start).Milliseconds()), len(res.Sources), requestLogStatus(err, res.Status))
 
 	if err != nil {
 		return nil, askDocsOutput{}, err
@@ -145,6 +166,29 @@ func (s *srv) mcpHandler() http.Handler {
 	// unlimited wrong-token guesses. Bucketing on IP before checking the
 	// token closes that off.
 	return s.withMCPRateLimit(s.withMCPAuth(h))
+}
+
+// withStreamCancel derives the request context from both r.Context() and
+// s.streamCtx, so ctx.Done() fires as soon as either the request itself ends
+// OR a graceful shutdown begins (see (*Server).CancelStreams) — whichever
+// comes first. Wired only onto the GET /api/mcp route (see New()): that is
+// the one handler with no bound of its own — the go-sdk's streamable HTTP
+// handler blocks its GET stream on the request context until the client
+// disconnects — unlike /api/ask and MCP POST calls, which are already
+// bounded by ANSWER_TOTAL_BUDGET and must keep draining normally while
+// shutdown is in progress.
+func (s *srv) withStreamCancel(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		// AfterFunc, not a bare goroutine select: stop() below deregisters
+		// the callback once the (far more common) case of the request ending
+		// on its own fires first, instead of leaking a goroutine parked on
+		// s.streamCtx.Done() for every GET stream ever opened.
+		stop := context.AfterFunc(s.streamCtx, cancel)
+		defer stop()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 // withMCPAuth requires `Authorization: Bearer <MCP_TOKEN>` when MCP_TOKEN is

@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"time"
 )
 
 // Dim is the embedding dimension produced by nomic-embed-text.
@@ -14,6 +16,19 @@ const Dim = 768
 
 const defaultHost = "http://localhost:11434"
 const model = "nomic-embed-text"
+
+// Transport timeouts. No overall http.Client.Timeout: EmbedBatch (the ingest
+// path) can legitimately push a large batch of texts through one request, and
+// a blanket deadline on the whole request/response cycle would cut that off
+// along with everything else. These bound the parts that should never take
+// long even for a big batch — connecting and getting the first response byte
+// — while leaving the body-read time uncapped. Per-call cancellation is the
+// caller's job via ctx (see answer.go's embedTimeout for the query path).
+const (
+	dialTimeout           = 5 * time.Second
+	tlsHandshakeTimeout   = 5 * time.Second
+	responseHeaderTimeout = 30 * time.Second
+)
 
 // Embedder calls the Ollama /api/embed endpoint.
 type Embedder struct {
@@ -27,7 +42,12 @@ func New() *Embedder {
 	if host == "" {
 		host = defaultHost
 	}
-	return &Embedder{host: host, client: &http.Client{}}
+	transport := &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+	}
+	return &Embedder{host: host, client: &http.Client{Transport: transport}}
 }
 
 // nomic-embed-text is trained with task prefixes: queries and documents live

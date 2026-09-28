@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 
 	"github.com/celestingeniaut/docs-rag/internal/store"
@@ -83,8 +82,8 @@ func init() {
 	rootCmd.AddCommand(migrateCmd)
 }
 
-func runMigrate(_ *cobra.Command, _ []string) error {
-	ctx := context.Background()
+func runMigrate(cmd *cobra.Command, _ []string) error {
+	ctx := cmd.Context()
 	dbURL := mustEnv("DATABASE_URL")
 
 	st, err := store.New(ctx, dbURL)

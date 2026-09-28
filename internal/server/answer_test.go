@@ -1,6 +1,58 @@
 package server
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+)
+
+// TestRequestLogStatus covers the client-disconnect reclassification: a
+// context.Canceled anywhere in the stage chain — however it got wrapped —
+// is logged as "cancelled" rather than folded into res.Status, since that
+// status came from a pipeline that never got to finish, not one that failed.
+func TestRequestLogStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status string
+		want   string
+	}{
+		{name: "no error: status passes through unchanged", err: nil, status: "error", want: "error"},
+		{name: "no error, ok status: passes through unchanged", err: nil, status: "ok", want: "ok"},
+		{name: "bare context.Canceled overrides status", err: context.Canceled, status: "error", want: "cancelled"},
+		{
+			name:   "context.Canceled wrapped by stageErr overrides status",
+			err:    &stageErr{Stage: "Search failed", Err: context.Canceled},
+			status: "error",
+			want:   "cancelled",
+		},
+		{
+			name:   "context.Canceled wrapped by fmt.Errorf %w overrides status",
+			err:    fmt.Errorf("ollama embed: %w", context.Canceled),
+			status: "error",
+			want:   "cancelled",
+		},
+		{
+			name:   "an unrelated error leaves status unchanged",
+			err:    errors.New("boom"),
+			status: "error",
+			want:   "error",
+		},
+		{
+			name:   "context.DeadlineExceeded is not treated as a cancellation",
+			err:    context.DeadlineExceeded,
+			status: "error",
+			want:   "error",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := requestLogStatus(tc.err, tc.status); got != tc.want {
+				t.Errorf("requestLogStatus(%v, %q) = %q, want %q", tc.err, tc.status, got, tc.want)
+			}
+		})
+	}
+}
 
 func TestSourceURL(t *testing.T) {
 	for _, tc := range []struct {
