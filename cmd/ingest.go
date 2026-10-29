@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/celestingeniaut/docs-rag/internal/chunker"
 	"github.com/celestingeniaut/docs-rag/internal/embedder"
@@ -29,7 +30,7 @@ func init() {
 }
 
 func runIngest(cmd *cobra.Command, _ []string) error {
-	ctx := context.Background()
+	ctx := cmd.Context()
 
 	docsPath := mustEnv("DOCS_PATH")
 
@@ -59,9 +60,14 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 				return err
 			}
 			defer func() {
-				// No-op once the swap has happened; drops a half-filled table when
-				// the run died before it.
-				if err := st.StageDiscard(context.Background()); err != nil {
+				// A fresh context, not ctx: by the time this runs (function
+				// return, possibly via Ctrl-C) ctx may already be cancelled,
+				// and this cleanup — dropping a half-filled table — must run
+				// regardless. Bounded rather than context.Background() alone
+				// so a wedged connection cannot hang process exit forever.
+				discardCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := st.StageDiscard(discardCtx); err != nil {
 					log.Printf("discard staging table: %v", err)
 				}
 			}()

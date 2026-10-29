@@ -7,9 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 // Defaults target a local Ollama, which also speaks the OpenAI-compatible
@@ -17,6 +20,52 @@ import (
 // dev and a hosted OpenAI-compatible gateway (LiteLLM) in prod.
 const defaultBaseURL = "http://localhost:11434/v1"
 const defaultModel = "qwen2.5:32b"
+
+// Transport timeouts. Deliberately no overall http.Client.Timeout: Ask's
+// response is a long-lived SSE stream (the model can legitimately take
+// 30-60s+ to finish generating), and a blanket deadline would sever it
+// mid-stream. ResponseHeaderTimeout still bounds time to the first byte —
+// the point where the model starts responding at all — so a hung backend is
+// caught without punishing a slow-but-alive one. Callers bound the whole
+// call via ctx instead (see answer.go's per-stage timeouts).
+const (
+	dialTimeout         = 5 * time.Second
+	tlsHandshakeTimeout = 5 * time.Second
+	// defaultResponseHeaderTimeout covers time to first byte, which for a
+	// streaming chat completion means time to the first token — generation
+	// can take a while to start, longer than a plain request/response call
+	// would need. Overridable via LLM_RESPONSE_HEADER_TIMEOUT: a cold local
+	// model (nothing resident in GPU/RAM yet) loading a ~20GB model file can
+	// take well past 60s before it emits a first token, longer than this
+	// default allows — see responseHeaderTimeout below and the README's
+	// "Health and shutdown" section.
+	defaultResponseHeaderTimeout = 60 * time.Second
+)
+
+// responseHeaderTimeout reads LLM_RESPONSE_HEADER_TIMEOUT (time.ParseDuration
+// format), falling back to defaultResponseHeaderTimeout when unset,
+// malformed, or not strictly positive — a zero or negative value would make
+// the very first outbound call fail instantly, which is not what a typo here
+// should do. Same validation contract as internal/server's envDuration,
+// reimplemented locally rather than imported: this package is configured
+// purely from the environment inside New() already (LLM_BASE_URL, LLM_MODEL,
+// LLM_API_KEY), and it must stay free of a dependency on internal/server,
+// which already imports internal/llm — importing back would cycle.
+func responseHeaderTimeout() time.Duration {
+	v := os.Getenv("LLM_RESPONSE_HEADER_TIMEOUT")
+	if v == "" {
+		return defaultResponseHeaderTimeout
+	}
+	d, err := time.ParseDuration(v)
+	if err == nil && d <= 0 {
+		err = fmt.Errorf("must be a positive duration, got %s", d)
+	}
+	if err != nil {
+		log.Printf("invalid LLM_RESPONSE_HEADER_TIMEOUT=%q, using default %s: %v", v, defaultResponseHeaderTimeout, err)
+		return defaultResponseHeaderTimeout
+	}
+	return d
+}
 
 // Client calls an OpenAI-compatible /chat/completions endpoint with streaming.
 type Client struct {
@@ -42,11 +91,16 @@ func New() *Client {
 	if model == "" {
 		model = defaultModel
 	}
+	transport := &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout(),
+	}
 	return &Client{
 		baseURL: base,
 		apiKey:  os.Getenv("LLM_API_KEY"),
 		model:   model,
-		client:  &http.Client{},
+		client:  &http.Client{Transport: transport},
 	}
 }
 

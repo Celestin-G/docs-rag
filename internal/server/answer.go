@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -131,6 +132,20 @@ type answerResult struct {
 	Status  string // "ok", "no_results" or "error"
 }
 
+// requestLogStatus is the status recorded to request_logs for one pipeline
+// run: normally res.Status, except a client that disconnected mid-request
+// (ctx cancelled, surfacing as context.Canceled somewhere in the stage
+// chain) is reported as "cancelled" rather than "error". The pipeline stage
+// itself would have succeeded had anyone still been listening, so folding it
+// into "error" would make /stats' error rate a worse signal for things
+// actually worth investigating.
+func requestLogStatus(err error, status string) string {
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	return status
+}
+
 // answer runs the full pipeline — translate, embed, search, generate — writing
 // the generated text to out.
 //
@@ -139,13 +154,27 @@ type answerResult struct {
 // filters, retrieval parameters and model are shared, both return the same
 // answer for the same input. Do not reimplement this pipeline elsewhere.
 func (s *srv) answer(ctx context.Context, req askReq, out io.Writer) (answerResult, error) {
+	// Bounds the whole pipeline, generation included: every stage context
+	// below is a child of this one, so none of them can outlive it even
+	// though each also carries its own, tighter deadline. See the default*
+	// timeout constants and the env vars documented on New() — s.* here
+	// rather than bare constants so both are actually configurable, and so a
+	// test can inject a short one against a deliberately slow fake upstream.
+	ctx, cancel := context.WithTimeout(ctx, s.totalAnswerBudget)
+	defer cancel()
+
 	// Translate to English before embedding so the query matches the English docs.
-	queryEn, err := s.llm.Translate(ctx, req.Question)
+	translateCtx, cancelTranslate := context.WithTimeout(ctx, s.translateTimeout)
+	queryEn, err := s.llm.Translate(translateCtx, req.Question)
+	cancelTranslate()
 	if err != nil {
-		queryEn = req.Question // graceful fallback
+		log.Printf("translate fallback: %v", err)
+		queryEn = req.Question // graceful fallback — a slow translator is no different from a failed one
 	}
 
-	vec, err := s.emb.Embed(ctx, queryEn)
+	embedCtx, cancelEmbed := context.WithTimeout(ctx, s.embedTimeout)
+	vec, err := s.emb.Embed(embedCtx, queryEn)
+	cancelEmbed()
 	if err != nil {
 		return answerResult{Status: "error"}, &stageErr{Stage: "Embedding failed", Err: err}
 	}
@@ -169,7 +198,9 @@ func (s *srv) answer(ctx context.Context, req askReq, out io.Writer) (answerResu
 
 	// Fetch more candidates than needed, then apply a diversity filter so no
 	// single file monopolises the context window.
-	rawChunks, err := s.store.Search(ctx, vec, queryEn, req.TopK*2, 0.25, filter)
+	searchCtx, cancelSearch := context.WithTimeout(ctx, s.searchTimeout)
+	rawChunks, err := s.store.Search(searchCtx, vec, queryEn, req.TopK*2, 0.25, filter)
+	cancelSearch()
 	if err != nil {
 		return answerResult{Status: "error"}, &stageErr{Stage: "Search failed", Err: err}
 	}

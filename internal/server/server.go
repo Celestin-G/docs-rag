@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,7 +21,10 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// rateLimit: 5 requests per minute per IP, burst of 3.
+// rateLimit: 5 requests per minute per IP, burst of 3, for /api/ask and
+// /api/feedback. MCP tool calls get their own, more generous budget (see
+// mcp.go) — agent traffic and anonymous browser traffic must not share a
+// bucket, or one starves the other.
 const (
 	ratePerMinute = 5
 	rateBurst     = 3
@@ -25,16 +32,133 @@ const (
 	expireAfter   = 10 * time.Minute
 )
 
+// defaultTrustedProxies matches the nginx-on-same-host deployment described
+// in nginx.conf: nginx is the only thing allowed to set X-Forwarded-For /
+// X-Real-IP for the Go app.
+const defaultTrustedProxies = "127.0.0.1/32,::1/128"
+
+// readyzTimeout bounds the database ping /readyz performs. Short on purpose:
+// readiness is polled repeatedly, and a slow ping is itself a "not ready"
+// signal — there is no reason to let one hang the probe.
+const readyzTimeout = 2 * time.Second
+
+// Per-stage pipeline timeouts (see answer.go), each overridable via env so an
+// operator can tune them without a rebuild. Fields on srv rather than bare
+// constants so a test can also inject a short one against a deliberately
+// slow fake upstream instead of waiting out the real default.
+const (
+	defaultTranslateTimeout  = 10 * time.Second
+	defaultEmbedTimeout      = 10 * time.Second
+	defaultSearchTimeout     = 5 * time.Second
+	defaultTotalAnswerBudget = 120 * time.Second
+)
+
+// envDuration reads a time.ParseDuration-formatted value from key, falling
+// back to def when unset, invalid, or not strictly positive. A zero or
+// negative duration is malformed the same way an unparseable string is: it
+// would produce an already-expired (or immediately-expiring) deadline, quietly
+// breaking every request that stage bounds rather than merely mistuning it.
+// Either kind of malformed value is logged rather than silently ignored,
+// since a typo here would otherwise quietly change request behaviour with no
+// visible signal.
+func envDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err == nil && d <= 0 {
+		err = fmt.Errorf("must be a positive duration, got %s", d)
+	}
+	if err != nil {
+		log.Printf("invalid %s=%q, using default %s: %v", key, v, def, err)
+		return def
+	}
+	return d
+}
+
+// EnvDuration is envDuration exported for callers outside this package.
+// cmd/serve.go's SHUTDOWN_TIMEOUT shares this exact contract (unset,
+// malformed or non-positive falls back to the caller's default) and reuses
+// this implementation rather than duplicating the parsing/validation logic a
+// second time.
+func EnvDuration(key string, def time.Duration) time.Duration {
+	return envDuration(key, def)
+}
+
 type limitEntry struct {
 	limiter  *rate.Limiter
 	lastSeen atomic.Int64 // unix nano
 }
 
+// rateLimiter is a per-IP token-bucket limiter for one class of route.
+// Each route class (ask/feedback vs MCP) owns its own instance so a burst
+// on one never eats into the other's budget.
+type rateLimiter struct {
+	entries sync.Map // map[string]*limitEntry
+	every   time.Duration
+	burst   int
+}
+
+func newRateLimiter(perMinute, burst int) *rateLimiter {
+	return &rateLimiter{every: time.Minute / time.Duration(perMinute), burst: burst}
+}
+
+// allow reports whether ip may proceed, consuming one token if so.
+func (rl *rateLimiter) allow(ip string) bool {
+	e := &limitEntry{limiter: rate.NewLimiter(rate.Every(rl.every), rl.burst)}
+	if v, loaded := rl.entries.LoadOrStore(ip, e); loaded {
+		e = v.(*limitEntry)
+	}
+	e.lastSeen.Store(time.Now().UnixNano())
+	return e.limiter.Allow()
+}
+
+// cleanup removes entries not seen since cutoff (unix nano), to prevent
+// unbounded memory growth from one-off IPs.
+func (rl *rateLimiter) cleanup(cutoff int64) {
+	rl.entries.Range(func(k, v any) bool {
+		if v.(*limitEntry).lastSeen.Load() < cutoff {
+			rl.entries.Delete(k)
+		}
+		return true
+	})
+}
+
+// pinger is the minimal capability /readyz depends on — just enough of
+// *store.Store to check connectivity, so a test can fake a failing database
+// without standing up a real one.
+type pinger interface {
+	Ping(ctx context.Context) error
+}
+
+// requestLogger is the minimal capability the request-log goroutine depends
+// on, for the same reason: a test can observe or fail writes without a real
+// database.
+type requestLogger interface {
+	InsertRequestLog(ctx context.Context, question string, durationMs, chunksFound int, status string) error
+}
+
 type srv struct {
-	store    *store.Store
-	emb      *embedder.Embedder
-	llm      *llm.Client
-	limiters sync.Map // map[string]*limitEntry
+	store *store.Store
+	emb   *embedder.Embedder
+	llm   *llm.Client
+
+	// ping and logger are also satisfied by store, set to it in New. Kept as
+	// separate interface-typed fields (rather than calling s.store directly)
+	// so tests can swap in a fake for just the readyz check or just request
+	// logging.
+	ping   pinger
+	logger requestLogger
+
+	askLimiter *rateLimiter
+	mcpLimiter *rateLimiter
+
+	// trustedProxies gates which RemoteAddr values may hand the app a client
+	// IP via X-Forwarded-For / X-Real-IP — see clientIP.
+	trustedProxies []netip.Prefix
+	// mcpToken, when non-empty, is required as a Bearer token on /api/mcp.
+	mcpToken string
 
 	eeMu        sync.Mutex
 	eeFeatures  []string
@@ -43,7 +167,108 @@ type srv struct {
 	verMu        sync.Mutex
 	verOptions   string
 	verFetchedAt time.Time
+
+	// logWG tracks the fire-and-forget request-log goroutines launched by
+	// handleAsk and askDocs, so a graceful shutdown can wait for them to
+	// finish (see (*Server).Wait) before the caller closes the DB pool out
+	// from under them.
+	logWG sync.WaitGroup
+
+	// logMu guards closing below, and pairs with it to make sync.WaitGroup's
+	// own misuse rule ("Add with a positive delta that starts when the
+	// counter is zero must happen before a Wait") actually safe: (*Server).Wait
+	// sets closing=true under logMu before calling logWG.Wait, and logRequest
+	// checks closing under the same logMu before adding to logWG. So no
+	// logRequest call can add to logWG concurrently with, or after, Wait
+	// begins draining it — it either lands strictly before (and Wait waits
+	// for it) or is rejected outright.
+	logMu   sync.Mutex
+	closing bool
+
+	// handlersWG tracks every in-flight HTTP handler (see (*Server).ServeHTTP)
+	// and every in-flight MCP tool call (see askDocs), not just request-log
+	// writes (logWG above). A graceful shutdown that only waited on logWG
+	// could still have handlers running after the caller closes the database
+	// pool, e.g. one that hasn't reached its logRequest call yet — see
+	// (*Server).WaitHandlers. Tool calls are counted on their own because the
+	// go-sdk runs them on a goroutine that outlives the POST carrying them
+	// once that POST's connection is force-closed.
+	handlersWG sync.WaitGroup
+
+	// handlersMu guards handlersClosing, the same way logMu guards closing
+	// for logWG: WaitHandlers sets handlersClosing under handlersMu before
+	// calling handlersWG.Wait, and enterHandler checks it under the same lock
+	// before adding, so no Add-from-zero can race that Wait. Separate from
+	// logMu/closing on purpose: handlers still unwinding while WaitHandlers
+	// waits must still be able to log their request.
+	handlersMu      sync.Mutex
+	handlersClosing bool
+
+	// hardStop is cancelled by (*Server).ForceCancel, on the forced path of
+	// a shutdown (SHUTDOWN_TIMEOUT elapsed). MCP tool calls derive their
+	// context from it (see askDocs): the go-sdk runs tool handlers on a
+	// context derived from the session's initialize request with its
+	// cancellation stripped (jsonrpc2's notDone), so cancelling
+	// http.Server's BaseContext never reaches them. /api/ask needs no such
+	// link — its context descends from BaseContext directly.
+	hardStop    context.Context
+	forceCancel context.CancelFunc
+
+	// streamCtx is cancelled the moment a graceful shutdown begins (see
+	// (*Server).CancelStreams, wired by cmd/serve.go via
+	// httpSrv.RegisterOnShutdown), independent of http.Server's own
+	// BaseContext — which stays live until Shutdown times out. Only the MCP
+	// GET stream handler derives its request context from it (see
+	// withStreamCancel in mcp.go): an open GET stream blocks on its request
+	// context with no timeout of its own, and would otherwise hold up the
+	// drain for the full SHUTDOWN_TIMEOUT for no benefit. /api/ask and MCP
+	// POST calls are already bounded by ANSWER_TOTAL_BUDGET and must keep
+	// draining normally during shutdown, so they are not wired to this.
+	streamCtx     context.Context
+	cancelStreams context.CancelFunc
+
+	// Per-stage pipeline timeouts, see the default* constants above.
+	translateTimeout  time.Duration
+	embedTimeout      time.Duration
+	searchTimeout     time.Duration
+	totalAnswerBudget time.Duration
 }
+
+// logRequest records analytics for one pipeline run in the background,
+// tracked by logWG so a graceful shutdown can drain it. The write gets its
+// own short-lived context, detached from the request's: by the time this
+// runs the request context may already be cancelled (client disconnect) or
+// about to be (server shutdown), and neither should abort an analytics write
+// that is already in flight.
+//
+// Refuses new work once (*Server).Wait has started draining logWG (see logMu
+// above): starting one then would either race Wait's own WaitGroup reuse
+// rules or, best case, still be running when the caller closes the DB pool
+// right after Wait returns. The write is not silently lost — the rejection is
+// logged, same as any other write failure.
+func (s *srv) logRequest(question string, durationMs, chunksFound int, status string) {
+	s.logMu.Lock()
+	if s.closing {
+		s.logMu.Unlock()
+		log.Printf("request log dropped (server closing): status=%s chunksFound=%d", status, chunksFound)
+		return
+	}
+	s.logWG.Add(1)
+	s.logMu.Unlock()
+	go func() {
+		defer s.logWG.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), logWriteTimeout)
+		defer cancel()
+		if err := s.logger.InsertRequestLog(ctx, question, durationMs, chunksFound, status); err != nil {
+			log.Printf("request log insert: %v", err)
+		}
+	}()
+}
+
+// logWriteTimeout bounds one request-log write. Generous relative to how
+// fast a single-row insert should be, but short enough that a graceful
+// shutdown's wait for logWG never hangs on a wedged connection.
+const logWriteTimeout = 5 * time.Second
 
 // enterpriseFeatures returns the EE feature list for the system prompt,
 // cached for 5 minutes. Returns nil on error — the prompt falls back to its
@@ -64,59 +289,288 @@ func (s *srv) enterpriseFeatures(ctx context.Context) []string {
 	return feats
 }
 
-// New wires up HTTP handlers and returns a ready handler.
-func New(st *store.Store, emb *embedder.Embedder, lm *llm.Client) http.Handler {
-	s := &srv{store: st, emb: emb, llm: lm}
+// Server is the docs-rag HTTP handler wired by New. It implements
+// http.Handler, so it drops into http.Server.Handler exactly like the plain
+// http.Handler New used to return. Callers that want a graceful shutdown
+// keep the concrete type around to call Wait afterwards — see cmd/serve.go.
+type Server struct {
+	mux *http.ServeMux
+	s   *srv
+}
+
+// enterHandler registers one unit of in-flight work in handlersWG, unless
+// (*Server).WaitHandlers has already started draining it (see handlersMu),
+// in which case it reports false and the caller must refuse the work. On
+// true the caller must call handlersWG.Done when finished.
+func (s *srv) enterHandler() bool {
+	s.handlersMu.Lock()
+	defer s.handlersMu.Unlock()
+	if s.handlersClosing {
+		return false
+	}
+	s.handlersWG.Add(1)
+	return true
+}
+
+// ServeHTTP tracks every request in handlersWG (see (*Server).WaitHandlers)
+// in addition to dispatching it, so a graceful shutdown can tell whether any
+// handler is still running before it closes the database pool out from under
+// it. A request that arrives once WaitHandlers has started draining (e.g. on
+// a keep-alive connection racing the shutdown) gets 503 with
+// Connection: close instead of running against a store about to be closed.
+func (h *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !h.s.enterHandler() {
+		w.Header().Set("Connection", "close")
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	defer h.s.handlersWG.Done()
+	h.mux.ServeHTTP(w, r)
+}
+
+// Wait blocks until every in-flight request-log write has finished, and
+// marks the server as closing first (see logMu on srv) so no new write can
+// start concurrently with, or after, this call. Call it after
+// http.Server.Shutdown returns and before closing the database pool —
+// otherwise a write started just before shutdown can still be running when
+// the pool it depends on goes away.
+func (h *Server) Wait() {
+	h.s.logMu.Lock()
+	h.s.closing = true
+	h.s.logMu.Unlock()
+	h.s.logWG.Wait()
+}
+
+// WaitHandlers blocks until every in-flight HTTP handler (see ServeHTTP) and
+// MCP tool call (see askDocs) has returned, or until timeout elapses,
+// whichever comes first. Reports whether every handler actually finished in
+// time. It first marks the server as no longer accepting handlers (see
+// handlersMu on srv): later requests get 503, later tool calls a tool error. Call it after http.Server.Shutdown
+// (and, if that timed out, Close — see cmd/serve.go) and before (*Server).Wait:
+// a handler generally makes its logRequest call as one of its last acts, so
+// draining handlers first means Wait is very unlikely to see a fresh write
+// start after it begins.
+func (h *Server) WaitHandlers(timeout time.Duration) bool {
+	h.s.handlersMu.Lock()
+	h.s.handlersClosing = true
+	h.s.handlersMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		h.s.handlersWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// CancelStreams cancels the context every long-lived MCP GET stream derives
+// its request context from, in addition to the request's own (see
+// withStreamCancel in mcp.go). Call it as soon as a graceful shutdown begins
+// (cmd/serve.go wires this via httpSrv.RegisterOnShutdown) so an open MCP
+// stream is released immediately instead of holding up the drain for the
+// full SHUTDOWN_TIMEOUT — it carries no in-progress answer to finish, unlike
+// /api/ask or an MCP tool call, which keep draining normally.
+func (h *Server) CancelStreams() { h.s.cancelStreams() }
+
+// ForceCancel cancels every in-flight MCP tool call (see hardStop on srv).
+// Call it on the forced path of a shutdown, next to cancelling
+// http.Server's BaseContext: that one reaches /api/ask but not MCP tool
+// calls, whose go-sdk context drops cancellation. Idempotent.
+func (h *Server) ForceCancel() { h.s.forceCancel() }
+
+// New wires up HTTP handlers and returns a ready handler. Configuration is
+// sourced from the environment:
+//   - TRUSTED_PROXIES : comma-separated CIDRs allowed to set X-Forwarded-For /
+//     X-Real-IP (default "127.0.0.1/32,::1/128", matching nginx on the same host)
+//   - MCP_TOKEN        : optional Bearer token required on /api/mcp
+//   - ANSWER_TRANSLATE_TIMEOUT, ANSWER_EMBED_TIMEOUT, ANSWER_SEARCH_TIMEOUT,
+//     ANSWER_TOTAL_BUDGET : per-stage pipeline timeouts (see answer.go),
+//     time.ParseDuration format; default* constants above apply when unset
+func New(st *store.Store, emb *embedder.Embedder, lm *llm.Client) (*Server, error) {
+	trustedProxies, err := parseTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
+	if err != nil {
+		return nil, fmt.Errorf("parse TRUSTED_PROXIES: %w", err)
+	}
+	mcpToken := os.Getenv("MCP_TOKEN")
+	if mcpToken == "" {
+		log.Printf("WARNING: MCP_TOKEN is not set — /api/mcp is unauthenticated")
+	}
+
+	streamCtx, cancelStreams := context.WithCancel(context.Background())
+	hardStop, forceCancel := context.WithCancel(context.Background())
+	s := &srv{
+		store:             st,
+		emb:               emb,
+		llm:               lm,
+		ping:              st,
+		logger:            st,
+		askLimiter:        newRateLimiter(ratePerMinute, rateBurst),
+		mcpLimiter:        newRateLimiter(mcpRatePerMinute, mcpRateBurst),
+		trustedProxies:    trustedProxies,
+		mcpToken:          mcpToken,
+		streamCtx:         streamCtx,
+		cancelStreams:     cancelStreams,
+		hardStop:          hardStop,
+		forceCancel:       forceCancel,
+		translateTimeout:  envDuration("ANSWER_TRANSLATE_TIMEOUT", defaultTranslateTimeout),
+		embedTimeout:      envDuration("ANSWER_EMBED_TIMEOUT", defaultEmbedTimeout),
+		searchTimeout:     envDuration("ANSWER_SEARCH_TIMEOUT", defaultSearchTimeout),
+		totalAnswerBudget: envDuration("ANSWER_TOTAL_BUDGET", defaultTotalAnswerBudget),
+	}
 	go s.cleanupLimiters()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.handleIndex)
-	mux.HandleFunc("POST /api/ask", s.withRateLimit(s.handleAsk))
-	mux.HandleFunc("POST /api/feedback", s.withRateLimit(s.handleFeedback))
+	mux.HandleFunc("POST /api/ask", s.withRateLimit(s.askLimiter, s.handleAsk))
+	mux.HandleFunc("POST /api/feedback", s.withRateLimit(s.askLimiter, s.handleFeedback))
 	mux.HandleFunc("GET /api/stats", s.handleStatsJSON)
 	mux.HandleFunc("GET /stats", s.handleStatsPage)
+	// Liveness/readiness probes: deliberately not behind withRateLimit (an
+	// orchestrator polling every few seconds must never be throttled) and
+	// never call logRequest (they are infrastructure plumbing, not
+	// documentation questions — mixing them into request_logs would skew the
+	// analytics /stats reports).
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /readyz", s.handleReadyz)
 	// MCP endpoint for agents. The streamable HTTP transport uses POST for calls,
 	// GET for the server-to-client stream and DELETE to end a session. Each method
 	// is registered on its own: a method-less "/api/mcp" pattern conflicts with
 	// "GET /" above, and ServeMux panics rather than pick a winner.
 	mcpHandler := s.mcpHandler()
 	mux.Handle("POST /api/mcp", mcpHandler)
-	mux.Handle("GET /api/mcp", mcpHandler)
+	// GET is the streamable HTTP transport's long-lived server-to-client
+	// stream — the one MCP route with no bound of its own — so it alone
+	// gets withStreamCancel, wired to streamCtx/CancelStreams above. POST and
+	// DELETE are short-lived and must keep draining normally during
+	// shutdown, bounded by ANSWER_TOTAL_BUDGET like any other tool call.
+	mux.Handle("GET /api/mcp", s.withStreamCancel(mcpHandler))
 	mux.Handle("DELETE /api/mcp", mcpHandler)
-	return mux
+	return &Server{mux: mux, s: s}, nil
 }
 
-// clientIP extracts the real client IP, honouring X-Forwarded-For when present.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.Index(xff, ","); i >= 0 {
-			return strings.TrimSpace(xff[:i])
+// handleHealthz is the liveness probe: it reports the process is up and
+// serving, without touching the database. A DB outage should surface as
+// "not ready" (see handleReadyz), not "restart the pod" — that would kill a
+// healthy process for a dependency it cannot fix by restarting.
+func (s *srv) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	io.WriteString(w, "ok")
+}
+
+// handleReadyz is the readiness probe: it pings the database with a short,
+// bounded timeout and reports 503 on failure, so a load balancer or
+// orchestrator stops sending traffic to an instance that cannot serve a
+// request all the way through, without killing the process itself.
+func (s *srv) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), readyzTimeout)
+	defer cancel()
+	if err := s.ping.Ping(ctx); err != nil {
+		log.Printf("readyz: database ping failed: %v", err)
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	io.WriteString(w, "ok")
+}
+
+// parseTrustedProxies parses a comma-separated CIDR list. An empty string
+// yields defaultTrustedProxies. Any invalid entry is a startup error — a
+// silently-ignored typo here would mean the app trusts client-controlled
+// headers from an unintended source.
+func parseTrustedProxies(raw string) ([]netip.Prefix, error) {
+	if strings.TrimSpace(raw) == "" {
+		raw = defaultTrustedProxies
+	}
+	parts := strings.Split(raw, ",")
+	prefixes := make([]netip.Prefix, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
 		}
-		return strings.TrimSpace(xff)
+		prefix, err := netip.ParsePrefix(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q: %w", p, err)
+		}
+		prefixes = append(prefixes, prefix)
 	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
+	return prefixes, nil
+}
+
+// clientIP extracts the real client IP. X-Forwarded-For / X-Real-IP are only
+// honoured when r.RemoteAddr belongs to a trusted proxy (see
+// parseTrustedProxies); otherwise any client could set those headers itself
+// to spoof its IP, evading its own rate limit or exhausting someone else's.
+//
+// When trusted, X-Forwarded-For is walked right-to-left: nginx appends the
+// address it actually observed to the end of the header
+// ($proxy_add_x_forwarded_for), so the rightmost entries are hops a trusted
+// proxy vouched for, while the leftmost entries are whatever the original
+// client claimed. The first entry (from the right) that is not itself a
+// trusted proxy is the real client.
+func clientIP(r *http.Request, trustedProxies []netip.Prefix) string {
+	remoteHost := hostOnly(r.RemoteAddr)
+	remoteAddr, err := netip.ParseAddr(remoteHost)
+	if err != nil || !addrTrusted(remoteAddr.Unmap(), trustedProxies) {
+		return remoteHost
 	}
-	// Strip port from RemoteAddr.
-	addr := r.RemoteAddr
-	if i := strings.LastIndex(addr, ":"); i >= 0 {
-		return addr[:i]
+
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			candidate := strings.TrimSpace(parts[i])
+			addr, err := netip.ParseAddr(candidate)
+			if err != nil {
+				continue
+			}
+			unmappedAddr := addr.Unmap()
+			if !addrTrusted(unmappedAddr, trustedProxies) {
+				return unmappedAddr.String()
+			}
+		}
+	}
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		addr, err := netip.ParseAddr(xri)
+		if err == nil {
+			return addr.Unmap().String()
+		}
+		// If X-Real-IP is invalid, fall back to RemoteAddr
+		return remoteHost
+	}
+	return remoteHost
+}
+
+// hostOnly strips the port from a host:port address, tolerating both IPv4
+// and bracketed IPv6 forms, and bare addresses with no port at all.
+func hostOnly(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
 	}
 	return addr
 }
 
-func (s *srv) getLimiter(ip string) *rate.Limiter {
-	e := &limitEntry{limiter: rate.NewLimiter(rate.Every(time.Minute/ratePerMinute), rateBurst)}
-	if v, loaded := s.limiters.LoadOrStore(ip, e); loaded {
-		e = v.(*limitEntry)
+func addrTrusted(addr netip.Addr, proxies []netip.Prefix) bool {
+	for _, p := range proxies {
+		if p.Contains(addr) {
+			return true
+		}
 	}
-	e.lastSeen.Store(time.Now().UnixNano())
-	return e.limiter
+	return false
 }
 
-func (s *srv) withRateLimit(next http.HandlerFunc) http.HandlerFunc {
+func (s *srv) clientIP(r *http.Request) string {
+	return clientIP(r, s.trustedProxies)
+}
+
+func (s *srv) withRateLimit(rl *rateLimiter, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip := clientIP(r)
-		if !s.getLimiter(ip).Allow() {
+		ip := s.clientIP(r)
+		if !rl.allow(ip) {
 			log.Printf("rate limit hit: %s", ip)
 			w.Header().Set("Retry-After", "60")
 			http.Error(w, "Too many requests — please wait a moment before asking again.", http.StatusTooManyRequests)
@@ -132,12 +586,8 @@ func (s *srv) cleanupLimiters() {
 	defer ticker.Stop()
 	for range ticker.C {
 		cutoff := time.Now().Add(-expireAfter).UnixNano()
-		s.limiters.Range(func(k, v any) bool {
-			if v.(*limitEntry).lastSeen.Load() < cutoff {
-				s.limiters.Delete(k)
-			}
-			return true
-		})
+		s.askLimiter.cleanup(cutoff)
+		s.mcpLimiter.cleanup(cutoff)
 	}
 }
 
@@ -260,14 +710,7 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 	reqStatus := "ok"
 	chunksFound := 0
 	defer func() {
-		go func() {
-			if err := s.store.InsertRequestLog(
-				context.Background(), req.Question,
-				int(time.Since(start).Milliseconds()), chunksFound, reqStatus,
-			); err != nil {
-				log.Printf("request log insert: %v", err)
-			}
-		}()
+		s.logRequest(req.Question, int(time.Since(start).Milliseconds()), chunksFound, reqStatus)
 	}()
 
 	flusher, ok := w.(http.Flusher)
@@ -292,7 +735,7 @@ func (s *srv) handleAsk(w http.ResponseWriter, r *http.Request) {
 	// Shared with the MCP tool — see (*srv).answer.
 	res, err := s.answer(ctx, req, &sseWriter{w: w, flusher: flusher})
 	chunksFound = len(res.Sources)
-	reqStatus = res.Status
+	reqStatus = requestLogStatus(err, res.Status)
 	if err != nil {
 		send(sseEvent{Type: "error", Text: err.Error()})
 		return

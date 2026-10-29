@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -25,7 +24,7 @@ func init() {
 }
 
 func runAsk(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+	ctx := cmd.Context()
 
 	question := strings.Join(args, " ")
 	dbURL := mustEnv("DATABASE_URL")

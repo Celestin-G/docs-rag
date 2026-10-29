@@ -106,17 +106,21 @@ Then open **http://localhost:8080**.
 
 Two independent rate-limiting layers (defence in depth):
 
-- **Go middleware** — 5 req/min per IP (burst 3) on `POST /api/ask` and `POST /api/feedback`, honouring `X-Forwarded-For`/`X-Real-IP` behind a proxy. Stale per-IP entries are garbage-collected automatically. Exceeding the limit returns `429` with a friendly message in the UI.
-- **nginx** (production) — same limit enforced at the network edge before requests reach the app (see below).
+- **Go middleware** — 5 req/min per IP (burst 3) on `POST /api/ask` and `POST /api/feedback`; MCP tool calls get their own, separate budget (20/min, burst 5) so agent traffic and browser traffic never share a bucket. Both honour `X-Forwarded-For`/`X-Real-IP`, but only from a trusted proxy — see `TRUSTED_PROXIES` below. Stale per-IP entries are garbage-collected automatically. Exceeding the limit returns `429` with a friendly message in the UI (or a plain `429` JSON response for MCP).
+- **nginx** (production) — same `/api/ask` limit enforced at the network edge before requests reach the app (see below).
 
 Input hardening on `/api/ask`: request body capped at 256 KB, question at 2 000 characters, history at the last 12 turns, `top_k` at 30. The system prompt also instructs the model to treat the user question as data, not instructions (prompt-injection mitigation).
+
+**MCP endpoint** (`/api/mcp`) — authentication is optional, controlled by `MCP_TOKEN`. When set, every request must carry `Authorization: Bearer <MCP_TOKEN>` (checked in constant time); missing or wrong tokens get `401` with a `WWW-Authenticate: Bearer` header, and the request never reaches the tool pipeline. When `MCP_TOKEN` is unset the endpoint stays open for backward compatibility, and the server logs a startup warning that it is unauthenticated. Either way, the endpoint is rate-limited (see above).
+
+**Trusted proxies** — `X-Forwarded-For` and `X-Real-IP` are only honoured when the request's `RemoteAddr` is itself a trusted proxy (`TRUSTED_PROXIES`, default `127.0.0.1/32,::1/128` — i.e. nginx on the same host). Otherwise those headers are client-controlled and would let anyone spoof their IP to dodge or pollute the rate limiter. When trusted, `X-Forwarded-For` is walked right-to-left to skip any trusted-proxy hops and find the address the proxy chain actually observed.
 
 ---
 
 ## Feedback & analytics
 
 - **👍/👎 buttons** under every answer — stored in the `feedback` table with the question and answer.
-- **Request logging** — every `/api/ask` call is recorded (duration, chunks found, status: `ok` / `error` / `no_results`).
+- **Request logging** — every `/api/ask` call is recorded (duration, chunks found, status: `ok` / `error` / `no_results` / `cancelled`, the last one meaning the client disconnected mid-request rather than the pipeline failing).
 - **`GET /stats`** — monitoring dashboard in the browser: total & today's requests, average duration, error rate, feedback volume and positive rate. Also available as raw JSON at `GET /api/stats`.
 
 Both tables are created with `IF NOT EXISTS` and survive `migrate` runs (only `doc_chunks` is dropped and rebuilt).
@@ -133,7 +137,7 @@ Both tables are created with `IF NOT EXISTS` and survive `migrate` runs (only `d
 
 ## Production deployment (nginx)
 
-For a customer-facing deployment, put nginx in front of the Go server. It handles rate limiting at the network edge, before requests reach the app, and passes the real client IP via `X-Real-IP` so the Go-level rate limiter also works correctly.
+For a customer-facing deployment, put nginx in front of the Go server. It handles rate limiting at the network edge, before requests reach the app, and passes the real client IP via `X-Real-IP` / `X-Forwarded-For` so the Go-level rate limiter also works correctly — every `location` block in `nginx.conf` that sets its own `proxy_set_header` repeats these, since nginx does not merge them in from the `server{}` block once a `location{}` sets its own.
 
 ```bash
 # Copy the provided config
@@ -146,10 +150,10 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Key settings in `nginx.conf`:
 - **Rate limit**: 5 req/min per IP, burst of 3 — applied only on `POST /api/ask`
-- **SSE streaming**: `proxy_buffering off` + `proxy_http_version 1.1` so tokens stream to the browser in real time
-- **Timeout**: `proxy_read_timeout 120s` — LLM generation can take 60s+, don't cut it short
+- **SSE streaming**: `proxy_buffering off` + `proxy_http_version 1.1` on both `/api/ask` and `/api/mcp` (the MCP streamable HTTP transport keeps a long-lived GET stream open the same way) so tokens/messages stream through in real time
+- **Timeout**: `proxy_read_timeout 120s` on `/api/ask` (LLM generation can take 60s+) and `600s` on `/api/mcp` (agent sessions can idle between tool calls) — don't cut either short
 
-The Go server also enforces the same 5 req/min limit independently (defence in depth). Set your domain in the `server_name` directive.
+The Go server also enforces its own rate limits independently (defence in depth): 5 req/min for `/api/ask`/`/api/feedback`, 20 req/min for `/api/mcp`. Set your domain in the `server_name` directive.
 
 ---
 
@@ -196,8 +200,39 @@ go run . ask "question"   Ask a question from the terminal (no UI)
 | `LLM_BASE_URL` | no | `http://localhost:11434/v1` | OpenAI-compatible base URL for **generation** (incl. `/v1`). Local Ollama by default; set to a LiteLLM gateway in prod |
 | `LLM_API_KEY` | no | — | Bearer token for `LLM_BASE_URL` (e.g. a LiteLLM key). Leave empty for keyless local Ollama |
 | `LLM_MODEL` | no | `qwen2.5:32b` | Generation model id — e.g. `qwen2.5:32b` (local) or `claude-opus-5` (LiteLLM) |
+| `TRUSTED_PROXIES` | no | `127.0.0.1/32,::1/128` | Comma-separated CIDRs allowed to set `X-Forwarded-For`/`X-Real-IP`. Invalid CIDRs fail server startup. |
+| `MCP_TOKEN` | no | — | Bearer token required on `/api/mcp` (`Authorization: Bearer <token>`). Left unset, the endpoint stays open and the server logs a startup warning. |
+| `SHUTDOWN_TIMEOUT` | no | `20s` | How long `serve` waits, on SIGINT/SIGTERM, for in-flight `/api/ask` and MCP requests to finish before forcibly cancelling everything still running. Open MCP GET streams are closed immediately regardless (see below). Rejected (falls back to the default) if zero, negative, or otherwise malformed — `time.ParseDuration` format (e.g. `45s`, `1m`). |
+| `ANSWER_TRANSLATE_TIMEOUT` | no | `10s` | Per-request budget for the translate stage. On timeout the pipeline falls back to the original question, same as on any other translate error (logged as `translate fallback: ...`). |
+| `ANSWER_EMBED_TIMEOUT` | no | `10s` | Per-request budget for the embed stage. |
+| `ANSWER_SEARCH_TIMEOUT` | no | `5s` | Per-request budget for the retrieval stage. |
+| `ANSWER_TOTAL_BUDGET` | no | `120s` | Overall budget for one `/api/ask` pipeline run — translate, embed, search and generation combined. |
+| `LLM_RESPONSE_HEADER_TIMEOUT` | no | `60s` | Time-to-first-byte bound on the LLM transport (see "Outbound HTTP" below). A cold local model — nothing yet resident in GPU/RAM, still loading a ~20GB file — can take longer than 60s to emit its first token; raise this (and `ANSWER_TRANSLATE_TIMEOUT`, which a cold model can also exceed) or keep the model warm (Ollama's `keep_alive`) instead of hitting this on every first request after idle. Same zero/negative-rejected rule as the timeouts above. |
 
 > **Generation is OpenAI-compatible.** The same client talks to local Ollama (`/v1/chat/completions`) or a hosted LiteLLM gateway — switching provider/model is pure config (`LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL`), no code change. Embeddings stay on Ollama's `nomic-embed-text` regardless.
+
+---
+
+## Health and shutdown
+
+- **`GET /healthz`** — liveness probe. Always `200 ok`, no database call: a DB outage should surface as "not ready" (see below), not as a reason to restart an otherwise-healthy process.
+- **`GET /readyz`** — readiness probe. Pings the database with a 2s timeout; `200 ok` when reachable, `503` otherwise. Point a load balancer or orchestrator at this one to stop routing traffic to an instance that can't complete a request.
+
+Neither endpoint is rate-limited (a health check polling every few seconds must never share the `/api/ask` budget) or written to `request_logs` (they're infrastructure plumbing, not documentation questions, and would skew the `/stats` analytics).
+
+**Graceful shutdown** — `serve` runs under a context cancelled on SIGINT/SIGTERM (`cmd.Execute`'s `signal.NotifyContext`). On shutdown it stops accepting new connections, then handles three kinds of in-flight work differently:
+
+- **Open MCP GET streams** (the streamable HTTP transport's server-to-client channel) are cancelled **immediately**, not drained. They carry no in-progress answer to finish — the underlying `mcp-go-sdk` handler simply blocks on its request context until the client goes away — so leaving one open would hold up shutdown for the full `SHUTDOWN_TIMEOUT` for no benefit. `/api/ask` streams and MCP tool calls (`POST`) are untouched by this and keep draining normally.
+- **`/api/ask` answers and MCP tool calls** drain normally for up to `SHUTDOWN_TIMEOUT` (default 20s) — they are already bounded by `ANSWER_TOTAL_BUDGET` per request, so most finish on their own well before that.
+- If `SHUTDOWN_TIMEOUT` elapses with requests still running, everything left is **forcibly cancelled**: the context of every in-flight `/api/ask` request and MCP tool call is cancelled (unblocking any handler that respects `ctx`, which every pipeline stage does), the listener and its connections are force-closed, and after a short grace period (5s) for handlers and tool calls to actually unwind, `serve` proceeds regardless. MCP tool calls need their own cancel signal for this: the `mcp-go-sdk` runs them on a context that drops the HTTP server's cancellation. From the moment that grace period starts, new work is refused: a request that still arrives gets `503` with `Connection: close`, a tool call gets a `server shutting down` tool error.
+
+The worst-case exit is therefore `SHUTDOWN_TIMEOUT` + 5s handler grace + 5s request-log drain (below) = 30s with the default, which fits the 30s `terminationGracePeriodSeconds` Kubernetes defaults to. If you raise `SHUTDOWN_TIMEOUT`, set your orchestrator's grace period to at least `SHUTDOWN_TIMEOUT` + 10s, or it will SIGKILL `serve` before the drain finishes. A **second** SIGINT/SIGTERM during shutdown kills the process immediately (default signal handling is restored after the first), for when you'd rather not wait.
+
+Only **after** that — draining in-flight request-log writes, which each self-bound (`logWriteTimeout`, 5s) — does `serve` close the database pool, so a write that started just before shutdown never runs against an already-closed pool; any request-log write attempted after draining begins is rejected (logged, not silently dropped) rather than racing that drain.
+
+`http.Server` has no `WriteTimeout`: it applies to a whole response including the body, and would sever a long-running SSE stream mid-token; `ReadHeaderTimeout` (10s) and `IdleTimeout` (120s) bound a slow or idle client without touching an active response.
+
+**Outbound HTTP** — the embedder and LLM clients set a dial timeout (5s) and TLS handshake timeout (5s) on their transport, plus a response-header timeout (time to first byte: 30s for the embedder, 60s for the LLM by default, overridable via `LLM_RESPONSE_HEADER_TIMEOUT` — see the environment variables table above). Neither client sets an overall `http.Client.Timeout`: `EmbedBatch` can legitimately run long for a big ingest batch, and the LLM client's response is itself a long streamed answer — a blanket deadline would cut either off along with a genuinely hung connection. Per-request bounds come from `answer.go`'s stage timeouts above instead. Note that a cold local `qwen2.5:32b` (nothing resident in GPU/RAM yet) can take longer than both `ANSWER_TRANSLATE_TIMEOUT` (10s) and the LLM response-header timeout (60s) just to start responding — raise either, or keep the model warm with Ollama's `keep_alive` option, if cold-start latency is a recurring problem rather than a one-off.
 
 ---
 
@@ -207,13 +242,13 @@ go run . ask "question"   Ask a question from the terminal (no UI)
 cmd/
   migrate.go   DB schema setup (pgvector + tsvector + GIN index + feedback/analytics tables)
   ingest.go    Documentation ingestion pipeline
-  serve.go     HTTP server entry point (with timeouts)
+  serve.go     HTTP server entry point (timeouts, graceful shutdown on SIGINT/SIGTERM)
   ask.go       Terminal Q&A mode
 internal/
   chunker/     MDX stripping, heading-aware chunking, page-title breadcrumbs
   embedder/    Ollama nomic-embed-text client (search_query:/search_document: prefixes)
   llm/         Ollama qwen2.5:32b streaming client + translate + hardened system prompt
-  server/      HTTP handlers, SSE streaming, rate limiting, feedback, stats, embedded web UI
+  server/      HTTP handlers, SSE streaming, rate limiting, feedback, stats, health checks, embedded web UI
   store/       pgvector hybrid search (vector + BM25), filters, feedback, analytics, EE features
 .github/workflows/
   update-docs.yml    Daily automated docs re-ingestion (08:00 UTC)

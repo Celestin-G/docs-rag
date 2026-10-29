@@ -3,6 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,6 +13,16 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// rateLimit for MCP tool calls: separate budget from /api/ask (see
+// server.go) — agent traffic must not starve, or be starved by, anonymous
+// browser traffic, and vice versa. 20/min with a burst of 5 is generous
+// enough for an interactive agent session while still bounding abuse of an
+// endpoint that, unlike /api/ask, may have no token configured at all.
+const (
+	mcpRatePerMinute = 20
+	mcpRateBurst     = 5
 )
 
 // askDocsDescription is what an agent reads to decide whether to call the tool
@@ -49,9 +62,33 @@ type askDocsOutput struct {
 	Sources []docSource `json:"sources" jsonschema:"sources cited in the answer, in citation order"`
 }
 
+// errShuttingDown is the tool error an MCP tool call gets once the server
+// has started draining handlers (see (*Server).WaitHandlers).
+var errShuttingDown = errors.New("server shutting down")
+
 // askDocs runs the same pipeline as the web UI, buffering the generated answer
 // instead of streaming it: MCP returns one result, not a stream.
+//
+// It registers itself in handlersWG (see WaitHandlers) and links ctx to
+// hardStop (see ForceCancel): the go-sdk hands it a context derived from the
+// session's initialize request with cancellation stripped, so neither the
+// POST's own context nor http.Server's BaseContext would ever stop it, and
+// the POST handler that carried it can return (connection force-closed)
+// while it is still running.
 func (s *srv) askDocs(ctx context.Context, _ *mcp.CallToolRequest, in askDocsInput) (*mcp.CallToolResult, askDocsOutput, error) {
+	if !s.enterHandler() {
+		// A returned error becomes an MCP tool error (IsError result), not a
+		// JSON-RPC protocol error.
+		return nil, askDocsOutput{}, errShuttingDown
+	}
+	defer s.handlersWG.Done()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if s.hardStop != nil { // nil only for a bare &srv{} built by a test
+		stop := context.AfterFunc(s.hardStop, cancel)
+		defer stop()
+	}
+
 	question := strings.TrimSpace(in.Question)
 	if question == "" {
 		return nil, askDocsOutput{}, fmt.Errorf("question is required")
@@ -74,15 +111,11 @@ func (s *srv) askDocs(ctx context.Context, _ *mcp.CallToolRequest, in askDocsInp
 	var buf bytes.Buffer
 	res, err := s.answer(ctx, req, &buf)
 
-	// Log MCP traffic alongside web traffic so /api/stats covers both.
-	go func() {
-		if err := s.store.InsertRequestLog(
-			context.Background(), question,
-			int(time.Since(start).Milliseconds()), len(res.Sources), res.Status,
-		); err != nil {
-			log.Printf("request log insert: %v", err)
-		}
-	}()
+	// Log MCP traffic alongside web traffic so /api/stats covers both. See
+	// (*srv).logRequest for why this is tracked by logWG and runs on its own
+	// short-lived context rather than ctx, and requestLogStatus for why a
+	// disconnected agent is "cancelled" rather than "error".
+	s.logRequest(question, int(time.Since(start).Milliseconds()), len(res.Sources), requestLogStatus(err, res.Status))
 
 	if err != nil {
 		return nil, askDocsOutput{}, err
@@ -110,11 +143,14 @@ func (s *srv) askDocs(ctx context.Context, _ *mcp.CallToolRequest, in askDocsInp
 
 // mcpHandler serves the Model Context Protocol endpoint over streamable HTTP.
 //
-// Deliberately not wrapped in withRateLimit: that limiter exists to stop an
-// anonymous browser from hammering /api/ask, and it counts per client IP. Agent
-// traffic arrives from a single gateway address, so the 5-per-minute budget
-// would be shared across every user of that gateway. Access here is already
-// restricted upstream, by network policy and by the agent's own allowlist.
+// Not wrapped in the /api/ask rate limiter — that budget (5/min) is sized for
+// an anonymous browser, and agent traffic can legitimately arrive from a
+// single gateway address, so sharing it would starve every user of that
+// gateway on one bad actor. MCP gets its own, more generous limiter
+// (mcpRatePerMinute/mcpRateBurst) keyed by the same client IP, plus an
+// optional bearer token (MCP_TOKEN) since — unlike /api/ask, which only
+// answers questions — this endpoint is reachable by any agent that can send
+// HTTP requests, not just the bundled web UI.
 func (s *srv) mcpHandler() http.Handler {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "docs-rag",
@@ -124,5 +160,86 @@ func (s *srv) mcpHandler() http.Handler {
 		Name:        "ask_formance_docs",
 		Description: askDocsDescription,
 	}, s.askDocs)
-	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
+	h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
+	// Rate limit first, auth second: a limiter that only counted
+	// successfully-authenticated requests would let an attacker send
+	// unlimited wrong-token guesses. Bucketing on IP before checking the
+	// token closes that off.
+	return s.withMCPRateLimit(s.withMCPAuth(h))
+}
+
+// withStreamCancel derives the request context from both r.Context() and
+// s.streamCtx, so ctx.Done() fires as soon as either the request itself ends
+// OR a graceful shutdown begins (see (*Server).CancelStreams) — whichever
+// comes first. Wired only onto the GET /api/mcp route (see New()): that is
+// the one handler with no bound of its own — the go-sdk's streamable HTTP
+// handler blocks its GET stream on the request context until the client
+// disconnects — unlike /api/ask and MCP POST calls, which are already
+// bounded by ANSWER_TOTAL_BUDGET and must keep draining normally while
+// shutdown is in progress.
+func (s *srv) withStreamCancel(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		// AfterFunc, not a bare goroutine select: stop() below deregisters
+		// the callback once the (far more common) case of the request ending
+		// on its own fires first, instead of leaking a goroutine parked on
+		// s.streamCtx.Done() for every GET stream ever opened.
+		stop := context.AfterFunc(s.streamCtx, cancel)
+		defer stop()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// withMCPAuth requires `Authorization: Bearer <MCP_TOKEN>` when MCP_TOKEN is
+// configured, comparing in constant time to avoid a timing side-channel on
+// the token. When MCP_TOKEN is unset the endpoint stays open (backward
+// compatible with existing deployments) — New() logs a startup warning in
+// that case.
+func (s *srv) withMCPAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.mcpToken == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		const prefix = "Bearer "
+		token := ""
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, prefix) {
+			token = strings.TrimPrefix(auth, prefix)
+		}
+		if subtle.ConstantTimeCompare([]byte(token), []byte(s.mcpToken)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="docs-rag-mcp"`)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withMCPRateLimit enforces the per-IP MCP budget before any protocol work
+// happens.
+//
+// This limits at the HTTP layer (429, mirroring /api/ask) rather than as an
+// MCP-protocol tool error: mcp.NewStreamableHTTPHandler owns the JSON-RPC
+// framing for POST (tool calls), GET (the server-to-client stream) and
+// DELETE (session teardown), and none of that machinery is reachable from
+// here without forking or wrapping the SDK's internals. Rejecting the HTTP
+// request outright is also strictly cheaper: it does no JSON-RPC parsing or
+// pipeline work, and a compliant MCP client already treats a non-2xx HTTP
+// response as a failed call.
+func (s *srv) withMCPRateLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := s.clientIP(r)
+		if !s.mcpLimiter.allow(ip) {
+			log.Printf("MCP rate limit hit: %s", ip)
+			w.Header().Set("Retry-After", "60")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]string{"error": "too many requests"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

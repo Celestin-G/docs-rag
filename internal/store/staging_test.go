@@ -2,27 +2,15 @@ package store
 
 import (
 	"context"
-	"os"
 	"testing"
 )
 
 // The point of staging is that the live index never stops answering. This walks
 // the sequence a re-ingest follows and checks the live table at every step.
 func TestStagingSwap(t *testing.T) {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		t.Skip("DATABASE_URL not set — skipping the SQL-level check")
-	}
+	s := testStore(t)
 	ctx := context.Background()
-	s, err := New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer s.Close()
 
-	if err := s.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector; DROP TABLE IF EXISTS "+chunksTable+" CASCADE;"+ChunkTableDDL(chunksTable, false)); err != nil {
-		t.Fatalf("reset: %v", err)
-	}
 	live := func() int64 {
 		var n int64
 		if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM "+chunksTable).Scan(&n); err != nil {
@@ -91,20 +79,9 @@ func TestStagingSwap(t *testing.T) {
 
 // Promoting nothing would recreate the outage staging exists to prevent.
 func TestStagingRefusesToPromoteAnEmptyIndex(t *testing.T) {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		t.Skip("DATABASE_URL not set — skipping the SQL-level check")
-	}
+	s := testStore(t)
 	ctx := context.Background()
-	s, err := New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer s.Close()
 
-	if err := s.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS vector; DROP TABLE IF EXISTS "+chunksTable+" CASCADE;"+ChunkTableDDL(chunksTable, false)); err != nil {
-		t.Fatalf("reset: %v", err)
-	}
 	if err := s.Insert(ctx, DocChunk{SourceFile: "kept.mdx", Content: "c", Embedding: make([]float32, 768)},
 		"", 0, 0, "stack", "both", nil); err != nil {
 		t.Fatalf("insert: %v", err)
@@ -124,5 +101,42 @@ func TestStagingRefusesToPromoteAnEmptyIndex(t *testing.T) {
 	}
 	if err := s.StageDiscard(ctx); err != nil {
 		t.Fatalf("discard: %v", err)
+	}
+}
+
+// StagePromote without a prior StageCreate must fail clearly (no staging
+// table exists to index or swap in) rather than panic or, worse, silently
+// operate on the live table.
+func TestStagePromoteWithoutStageCreateFails(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	if err := s.Insert(ctx, DocChunk{SourceFile: "kept.mdx", Content: "c", Embedding: make([]float32, 768)},
+		"", 0, 0, "stack", "both", nil); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	if err := s.StagePromote(ctx); err == nil {
+		t.Fatal("promoted with no staging table ever created — should have failed")
+	}
+
+	var n int64
+	if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM "+chunksTable).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("live index has %d rows after the failed promote, want the original 1 untouched", n)
+	}
+}
+
+// StageDiscard is called on every failure path in the real ingest command,
+// including ones where StageCreate itself never ran (e.g. the DSN was bad).
+// It must be a no-op rather than an error in that case.
+func TestStageDiscardIsSafeWithoutStageCreate(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	if err := s.StageDiscard(ctx); err != nil {
+		t.Fatalf("discard with no staging table ever created: %v", err)
 	}
 }

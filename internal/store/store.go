@@ -38,6 +38,12 @@ func (s *Store) Close() {
 	s.pool.Close()
 }
 
+// Ping checks connectivity to the database. Used by the /readyz endpoint —
+// callers should bound ctx with a short timeout of their own.
+func (s *Store) Ping(ctx context.Context) error {
+	return s.pool.Ping(ctx)
+}
+
 // DocChunk is a document chunk with its embedding.
 type DocChunk struct {
 	SourceFile string
