@@ -107,7 +107,7 @@ Widening is a safe error: the bot may show a chunk that does not apply, but it n
 
 ### Empty ranges are excluded
 
-A converted range that is empty (`version_min >= version_below`) means that no Stack release ships the range. The chunk is excluded, not widened. An inline `<When>` block with an empty range is excluded in the same way: its paragraph is left out of the body. `docs-rag` lists every excluded chunk and block in its dry-run output, with the reason "empty range after conversion".
+A converted range that is empty (`version_min >= version_below`) means that no Stack release ships the range. The chunk is excluded, not widened. An inline `<When>` block with an empty range is excluded in the same way: its paragraph is left out of the body. `docs-rag` lists every excluded chunk and block in its dry-run output under the heading "EXCLUDED: no Stack release ships these ranges", one line per entry (level page or inline, file, component, bounds).
 
 Excluding is safe here: no supported Stack release ships the content, so no customer needs it.
 
