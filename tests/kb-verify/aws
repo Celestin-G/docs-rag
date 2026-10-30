@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fake `aws` CLI for scripts/kb-verify.sh tests. Never talks to AWS.
 # Env: FAKE_AWS_DIR (state dir, required; every call is logged to calls.log)
-#      FAKE_AWS_SCENARIO: happy | leak (ignores the filter) | numeric_reject | no_later | retrieve_fail | kb_missing
+#      FAKE_AWS_SCENARIO: happy | empty | garbage | sparse | leak (ignores the filter) | numeric_reject | no_later | retrieve_fail | kb_missing
 set -euo pipefail
 
 state="${FAKE_AWS_DIR:?}"
@@ -45,6 +45,13 @@ retrieve() {
     echo "An error occurred (ValidationException) when calling the Retrieve operation: unsupported filter operator" >&2
     exit 254
   fi
+  case "${scenario}" in
+    empty) echo '{"retrievalResults":[]}'; return 0 ;;
+    garbage) echo 'not json <html>'; return 0 ;;
+    sparse) # no metadata at all, then a result lacking version_min/version_below
+      echo '{"retrievalResults":[{"content":{"text":"x"},"score":0.5},{"content":{"text":"y"},"metadata":{"client_id":"none","deployment":"any","license":"any"}}]}'
+      return 0 ;;
+  esac
   corpus | jq -c --argjson cfg "${cfg}" --arg scenario "${scenario}" '
     def num: if type == "string" then tonumber else . end;
     def ev($m):

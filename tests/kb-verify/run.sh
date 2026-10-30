@@ -135,6 +135,41 @@ test_config_guards() {
   check "unknown option refused" "$([ "${RC}" -eq 2 ] && echo 0 || echo 1)"
 }
 
+test_edge_responses() {
+  run_case empty
+  check "empty: exit 0, nothing to check" "$((RC != 0))"
+  check "empty: '(no results)' printed and inconclusive INFO" "$(has '(no results)' && has 'INFO: 1b X=301: 0 results, nothing to check' && echo 0 || echo 1)"
+  run_case garbage
+  check "garbage: exit 1 with parse FAIL, no jq crash" "$([ "${RC}" -eq 1 ] && has 'could not parse the Retrieve response' && echo 0 || echo 1)"
+  run_case sparse
+  check "sparse: missing metadata and missing version keys are violations (FAIL, exit 1)" "$([ "${RC}" -eq 1 ] && has 'FAIL: 1b X=301' && has 'FAIL: 4 combined' && echo 0 || echo 1)"
+  check "sparse: missing values printed as ?" "$(yes 'version_min=? version_below=?')"
+}
+
+test_query_quoting() {
+  local q='a"b\c $(touch pwned) `id` '"'"'q'"'"' ; {"x":1}'
+  run_case happy --baseline-query "${q}" --cloud-query "${q}" --ee-query "${q}"
+  check "quoting: exit 0 with hostile query" "$((RC != 0))"
+  check "quoting: query is JSON-escaped in every retrieve" \
+    "$(retrieves | grep -vF -- '"text":"a\"b\\c $(touch pwned) `id` '"'"'q'"'"' ; {\"x\":1}"' | grep -q . && echo 1 || echo 0)"
+  check "quoting: nothing executed" "$([ ! -e pwned ] && echo 0 || echo 1)"
+}
+
+test_more_config_guards() {
+  run_case happy --results 101
+  check "results: 101 refused" "$([ "${RC}" -eq 2 ] && echo 0 || echo 1)"
+  run_case happy --results abc
+  check "results: non numeric refused" "$([ "${RC}" -eq 2 ] && echo 0 || echo 1)"
+  run_case happy --kb-id
+  check "flag without value refused" "$([ "${RC}" -eq 2 ] && has 'needs a value' && echo 0 || echo 1)"
+  run_case happy --stack-version 03.01
+  check "stack-version: leading zeros are decimal (301)" "$(yes 'Stack v03.01 = 301')"
+  run_case happy --stack-version 3.1.2
+  check "stack-version: 3 parts refused" "$([ "${RC}" -eq 2 ] && echo 0 || echo 1)"
+  run_case happy --help
+  check "help: exit 0, no aws call" "$([ "${RC}" -eq 0 ] && [ ! -s "${FAKE_DIR}/calls.log" ] && echo 0 || echo 1)"
+}
+
 test_happy_path
 test_filter_shape
 test_violation
@@ -143,6 +178,9 @@ test_inconclusive_baseline
 test_retrieve_failure
 test_overrides_and_preflight
 test_config_guards
+test_edge_responses
+test_query_quoting
+test_more_config_guards
 
 echo "----"
 echo "${TESTS} checks, ${FAILURES} failed"
