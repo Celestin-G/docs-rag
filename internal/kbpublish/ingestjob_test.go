@@ -16,17 +16,22 @@ type fakeIngest struct {
 	gets      int
 	getErr    error
 
-	latest    Job // returned by Latest
-	latestOK  bool
-	latestErr error
+	recent    []Job // returned by Recent, newest first
+	afterWait []Job // returned by Recent once Get was called
+	recentErr error
+	desc      string // description of the last Start
 }
 
-func (f *fakeIngest) Latest(context.Context) (Job, bool, error) {
-	return f.latest, f.latestOK, f.latestErr
+func (f *fakeIngest) Recent(context.Context, int) ([]Job, error) {
+	if f.gets > 0 {
+		return f.afterWait, f.recentErr
+	}
+	return f.recent, f.recentErr
 }
 
-func (f *fakeIngest) Start(context.Context) (Job, error) {
+func (f *fakeIngest) Start(_ context.Context, description string) (Job, error) {
 	f.starts++
+	f.desc = description
 	if len(f.startErrs) > 0 {
 		err := f.startErrs[0]
 		f.startErrs = f.startErrs[1:]
@@ -83,6 +88,15 @@ func TestSyncerRun(t *testing.T) {
 func TestRunIfStale(t *testing.T) {
 	boom := errors.New("boom")
 	complete := Job{ID: "new", Status: StatusComplete}
+	const plan = "docs-rag plan=abc"
+	t0 := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	ours := func(mut func(*Job)) []Job {
+		j := Job{ID: "old", Status: StatusComplete, Description: plan, StartedAt: t0.Add(time.Hour)}
+		if mut != nil {
+			mut(&j)
+		}
+		return []Job{{ID: "other", Status: StatusComplete, Description: "manual sync", StartedAt: t0.Add(2 * time.Hour)}, j}
+	}
 	for _, tc := range []struct {
 		name    string
 		api     *fakeIngest
@@ -91,25 +105,46 @@ func TestRunIfStale(t *testing.T) {
 		starts  int
 		gets    int
 	}{
-		{"last job complete: nothing to do", &fakeIngest{latest: Job{ID: "old", Status: StatusComplete}, latestOK: true}, false, "", 0, 0},
+		{"consistent: nothing to do", &fakeIngest{recent: ours(nil)}, false, "", 0, 0},
 		{"no job ever: start one", &fakeIngest{states: []Job{complete}}, true, "", 1, 0},
-		{"last job failed: start one", &fakeIngest{latest: Job{ID: "old", Status: StatusFailed}, latestOK: true, states: []Job{complete}}, true, "", 1, 0},
-		{"last job stopped: start one", &fakeIngest{latest: Job{ID: "old", Status: StatusStopped}, latestOK: true, states: []Job{complete}}, true, "", 1, 0},
-		{"last job completed with failed documents: start one", &fakeIngest{latest: Job{ID: "old", Status: StatusComplete, Stats: JobStats{Failed: 1}}, latestOK: true, states: []Job{complete}}, true, "", 1, 0},
-		{"last job running: wait, do not start", &fakeIngest{latest: Job{ID: "old", Status: StatusInProgress}, latestOK: true, states: []Job{{}, {ID: "old", Status: StatusComplete}}}, true, "", 0, 1},
-		{"running job then fails", &fakeIngest{latest: Job{ID: "old", Status: StatusStarting}, latestOK: true, states: []Job{{}, {ID: "old", Status: StatusFailed}}}, true, "ended FAILED", 0, 1},
-		{"list error", &fakeIngest{latestErr: boom}, false, "list ingestion jobs: boom", 0, 0},
+		{"jobs of others only: start one", &fakeIngest{recent: []Job{{ID: "x", Status: StatusComplete, Description: "manual"}}, states: []Job{complete}}, true, "", 1, 0},
+		{"last job failed", &fakeIngest{recent: ours(func(j *Job) { j.Status = StatusFailed }), states: []Job{complete}}, true, "", 1, 0},
+		{"last job stopped", &fakeIngest{recent: ours(func(j *Job) { j.Status = StatusStopped }), states: []Job{complete}}, true, "", 1, 0},
+		{"completed with failed documents", &fakeIngest{recent: ours(func(j *Job) { j.Stats.Failed = 1 }), states: []Job{complete}}, true, "", 1, 0},
+		{"started before the newest object", &fakeIngest{recent: ours(func(j *Job) { j.StartedAt = t0.Add(-time.Minute) }), states: []Job{complete}}, true, "", 1, 0},
+		{"started at the same instant as the newest object", &fakeIngest{recent: ours(func(j *Job) { j.StartedAt = t0 }), states: []Job{complete}}, true, "", 1, 0},
+		{"another plan", &fakeIngest{recent: ours(func(j *Job) { j.Description = "docs-rag plan=old" }), states: []Job{complete}}, true, "", 1, 0},
+		{"a running job is waited for, then the rules apply", &fakeIngest{recent: []Job{{ID: "r", Status: StatusInProgress}}, afterWait: []Job{{ID: "r", Status: StatusComplete}}, states: []Job{complete, {ID: "r", Status: StatusComplete}}}, true, "", 1, 1},
+		{"running job fails: wait, then start", &fakeIngest{recent: []Job{{ID: "r", Status: StatusStarting}}, afterWait: []Job{{ID: "r", Status: StatusFailed}}, states: []Job{complete, {ID: "r", Status: StatusFailed}}}, true, "", 1, 1},
+		{"list error", &fakeIngest{recentErr: boom}, false, "list ingestion jobs: boom", 0, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &Syncer{API: tc.api, Sleep: noSleep}
-			_, ran, err := s.RunIfStale(t.Context(), time.Hour)
+			s := &Syncer{API: tc.api, Description: plan, Sleep: noSleep}
+			_, ran, err := s.RunIfStale(t.Context(), time.Hour, t0)
 			if tc.wantErr == "" && err != nil || tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
 				t.Errorf("err = %v, want %q", err, tc.wantErr)
 			}
 			if ran != tc.ran || tc.api.starts != tc.starts || tc.api.gets != tc.gets {
 				t.Errorf("ran %v starts %d gets %d, want %v %d %d", ran, tc.api.starts, tc.api.gets, tc.ran, tc.starts, tc.gets)
 			}
+			if tc.starts > 0 && tc.api.desc != plan {
+				t.Errorf("job started with description %q, want %q", tc.api.desc, plan)
+			}
 		})
+	}
+}
+
+func TestPlanHashAndDescription(t *testing.T) {
+	a, b := NewFile("docs/a.md", "a", validAttrs()), NewFile("docs/b.md", "b", validAttrs())
+	h := PlanHash([]File{a, b})
+	if h != PlanHash([]File{b, a}) {
+		t.Error("the plan hash depends on the order of the files")
+	}
+	if h == PlanHash([]File{a}) || h == PlanHash([]File{a, NewFile("docs/b.md", "changed", validAttrs())}) {
+		t.Error("the plan hash ignores a deleted or changed file")
+	}
+	if d := PlanDescription(h); !strings.HasPrefix(d, DescriptionPrefix) || len(d) > maxDescriptionLen {
+		t.Errorf("description %q: wrong prefix or longer than %d", d, maxDescriptionLen)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -57,8 +58,23 @@ func SidecarKey(key string) string { return key + sidecarSuffix }
 
 // Object is one entry of a bucket listing.
 type Object struct {
-	Key  string
-	Size int64
+	Key      string
+	Size     int64
+	Modified time.Time // LastModified of the listing
+}
+
+// PlanHash identifies the desired state of the bucket: sha256 over the sorted
+// "key:hash" lines of the files. A job started for another plan (or none) leaves
+// the knowledge base out of date, even when no object was written since: a crash
+// after the deletions leaves no LastModified behind.
+func PlanHash(files []File) string {
+	lines := make([]string, len(files))
+	for i, f := range files {
+		lines[i] = f.Key + ":" + f.Hash
+	}
+	sort.Strings(lines)
+	sum := sha256.Sum256([]byte(strings.Join(lines, "\n") + "\n"))
+	return hex.EncodeToString(sum[:])
 }
 
 // ObjectStore is what the publisher needs from the bucket.
@@ -96,6 +112,8 @@ type Diff struct {
 	Others []string
 	// Existing is the number of objects under docs/ before the publish.
 	Existing int
+	// Newest is the latest LastModified among them, zero when there are none.
+	Newest time.Time
 }
 
 // DeleteKeys returns every object key to remove: stale bodies with their
@@ -128,15 +146,19 @@ func ComputeDiff(ctx context.Context, store ObjectStore, files []File, concurren
 		return nil, fmt.Errorf("list s3://…/%s: %w", keyPrefix, err)
 	}
 	have := make(map[string]bool, len(existing))
+	var newest time.Time
 	for _, o := range existing {
 		have[o.Key] = true
+		if o.Modified.After(newest) {
+			newest = o.Modified
+		}
 	}
 	want := make(map[string]File, len(files))
 	for _, f := range files {
 		want[f.Key] = f
 	}
 
-	d := &Diff{Existing: len(existing)}
+	d := &Diff{Existing: len(existing), Newest: newest}
 	var toCheck []File
 	for _, f := range files {
 		switch {
@@ -291,7 +313,7 @@ func (s *S3Store) List(ctx context.Context, prefix string) ([]Object, error) {
 			return nil, err
 		}
 		for _, o := range res.Contents {
-			out = append(out, Object{Key: aws.ToString(o.Key), Size: aws.ToInt64(o.Size)})
+			out = append(out, Object{Key: aws.ToString(o.Key), Size: aws.ToInt64(o.Size), Modified: aws.ToTime(o.LastModified)})
 		}
 		if !aws.ToBool(res.IsTruncated) || res.NextContinuationToken == nil {
 			return out, nil

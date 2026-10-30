@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -105,7 +106,7 @@ func TestComputeDiff(t *testing.T) {
 	check("orphans", d.OrphanSidecars, []string{"docs/orphan.md" + sidecarSuffix})
 	check("others", d.Others, []string{"docs/notes.txt"})
 	check("delete keys", d.DeleteKeys(), []string{"docs/gone.md", "docs/gone.md" + sidecarSuffix, "docs/notes.txt", "docs/orphan.md" + sidecarSuffix})
-	if d.Unchanged != 1 || d.Existing != 11 || !d.Changes() {
+	if d.Unchanged != 1 || d.Existing != 11 || !d.Changes() || !d.Newest.IsZero() {
 		t.Errorf("unchanged %d existing %d", d.Unchanged, d.Existing)
 	}
 }
@@ -265,7 +266,7 @@ func (f *fakeS3) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Input, _ .
 	}
 	out := &s3.ListObjectsV2Output{IsTruncated: aws.Bool(i+1 < len(f.pages))}
 	for _, k := range f.pages[i] {
-		out.Contents = append(out.Contents, types.Object{Key: aws.String(k), Size: aws.Int64(1)})
+		out.Contents = append(out.Contents, types.Object{Key: aws.String(k), Size: aws.Int64(1), LastModified: aws.Time(time.Date(2026, 10, 30, 8, len(out.Contents), 0, 0, time.UTC))})
 	}
 	if i+1 < len(f.pages) {
 		out.NextContinuationToken = aws.String(fmt.Sprint(i + 1))
@@ -299,7 +300,7 @@ func TestS3Store(t *testing.T) {
 	}
 	s := &S3Store{API: api, Bucket: "bkt"}
 	objs, err := s.List(t.Context(), "docs/")
-	if err != nil || len(objs) != 3 {
+	if err != nil || len(objs) != 3 || objs[1].Modified.Minute() != 1 {
 		t.Fatalf("list across pages = %v, %v", objs, err)
 	}
 	if h, err := s.Hash(t.Context(), "docs/a.md"); h != "abc" || err != nil {

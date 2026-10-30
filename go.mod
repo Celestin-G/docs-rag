@@ -10,7 +10,7 @@ require (
 	golang.org/x/time v0.15.0
 )
 
-require github.com/aws/aws-sdk-go-v2/service/bedrockagent v1.69.2 // indirect
+require github.com/aws/aws-sdk-go-v2/service/bedrockagent v1.69.2
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.5

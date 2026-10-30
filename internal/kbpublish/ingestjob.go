@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 )
@@ -19,6 +20,18 @@ const (
 	StatusStopped    = "STOPPED"
 )
 
+const (
+	// DescriptionPrefix marks the ingestion jobs started by docs-rag.
+	DescriptionPrefix = "docs-rag plan="
+	// maxDescriptionLen is the Bedrock limit of a job description.
+	maxDescriptionLen = 200
+	// RecentJobs is how many of the latest jobs are scanned for docs-rag's own.
+	RecentJobs = 50
+)
+
+// PlanDescription is the description of the job that ingests a plan.
+func PlanDescription(planHash string) string { return DescriptionPrefix + planHash }
+
 // ErrIngestConflict means another ingestion job is already running on the data
 // source (Bedrock allows one at a time).
 var ErrIngestConflict = errors.New("another ingestion job is running")
@@ -31,6 +44,8 @@ type JobStats struct {
 // Job is the state of one ingestion job.
 type Job struct {
 	ID             string
+	Description    string
+	StartedAt      time.Time
 	Status         string
 	Stats          JobStats
 	FailureReasons []string
@@ -48,17 +63,21 @@ func (j Job) Terminal() bool {
 // IngestAPI is the subset of the Bedrock Agent API the publisher uses, on the
 // configured knowledge base and data source.
 type IngestAPI interface {
-	// Start starts a job and returns ErrIngestConflict when one is running.
-	Start(ctx context.Context) (Job, error)
+	// Start starts a job with the description (at most 200 characters) and
+	// returns ErrIngestConflict when one is running.
+	Start(ctx context.Context, description string) (Job, error)
 	Get(ctx context.Context, jobID string) (Job, error)
-	// Latest returns the most recently started job of the data source (without
-	// failure reasons), false when there is none.
-	Latest(ctx context.Context) (Job, bool, error)
+	// Recent returns at most n jobs of the data source, the most recently started
+	// first, without failure reasons.
+	Recent(ctx context.Context, n int) ([]Job, error)
 }
 
 // Syncer runs an ingestion job to the end.
 type Syncer struct {
-	API          IngestAPI
+	API IngestAPI
+	// Description is set on every job the syncer starts: PlanDescription of the
+	// plan being published.
+	Description  string
 	PollInterval time.Duration
 	// Sleep waits for d or until ctx is done; replaced in tests.
 	Sleep func(ctx context.Context, d time.Duration) error
@@ -110,7 +129,7 @@ func (s *Syncer) run(ctx context.Context, timeout time.Duration, sleep func(cont
 	var job Job
 	for {
 		var err error
-		job, err = s.API.Start(ctx)
+		job, err = s.API.Start(ctx, s.Description)
 		if err == nil {
 			break
 		}
@@ -143,31 +162,56 @@ func (s *Syncer) wait(ctx context.Context, job Job, timeout time.Duration, sleep
 }
 
 // RunIfStale is for a publish that changed nothing in the bucket. The knowledge
-// base is still stale when the previous ingestion failed or timed out, so it
-// looks at the latest job of the data source: one still running is waited for,
-// one that completed with no failed document means nothing to do (ran is
-// false), anything else (failed, stopped, failed documents, no job at all)
-// starts a new job.
-func (s *Syncer) RunIfStale(ctx context.Context, timeout time.Duration) (job Job, ran bool, err error) {
+// base can still be stale: an earlier run may have written to S3 and crashed, or
+// failed to start its job, before ingesting. A sync is started unless the latest
+// docs-rag job (found among the RecentJobs latest, by its description prefix) is
+//   - COMPLETE with no failed document,
+//   - started after newest, the latest LastModified under docs/, and
+//   - described as s.Description, i.e. ingested this very plan (this covers a
+//     crash after deletions, which leave no LastModified).
+//
+// A job still running (any, ours or not) is waited for first, then the rules are
+// evaluated again. ran is false when nothing was started.
+func (s *Syncer) RunIfStale(ctx context.Context, timeout time.Duration, newest time.Time) (job Job, ran bool, err error) {
 	ctx, cancel, sleep, interval := s.timed(ctx, timeout)
 	defer cancel()
-	latest, ok, err := s.API.Latest(ctx)
-	if err != nil {
-		return Job{}, false, fmt.Errorf("list ingestion jobs: %w", err)
-	}
-	switch {
-	case ok && !latest.Terminal():
-		s.logf("ingestion job %s is still %s, waiting for it", latest.ID, latest.Status)
-		job, err = s.wait(ctx, latest, timeout, sleep, interval)
+	for {
+		jobs, err := s.API.Recent(ctx, RecentJobs)
+		if err != nil {
+			return Job{}, false, fmt.Errorf("list ingestion jobs: %w", err)
+		}
+		if i := slices.IndexFunc(jobs, func(j Job) bool { return !j.Terminal() }); i >= 0 {
+			running := jobs[i]
+			s.logf("ingestion job %s is still %s, waiting for it", running.ID, running.Status)
+			if done, err := s.wait(ctx, running, timeout, sleep, interval); err != nil && !done.Terminal() {
+				return done, true, err
+			}
+			continue // its own outcome counts through the re-evaluation
+		}
+		var ours *Job
+		for i := range jobs {
+			if strings.HasPrefix(jobs[i].Description, DescriptionPrefix) {
+				ours = &jobs[i]
+				break
+			}
+		}
+		why := "no docs-rag ingestion job found"
+		if ours != nil {
+			switch {
+			case ours.Status != StatusComplete || ours.Stats.Failed > 0:
+				why = fmt.Sprintf("the last docs-rag job %s did not complete cleanly (%s, %d failed documents)", ours.ID, ours.Status, ours.Stats.Failed)
+			case !ours.StartedAt.After(newest):
+				why = fmt.Sprintf("the last docs-rag job %s started before the newest object of the bucket", ours.ID)
+			case ours.Description != s.Description:
+				why = fmt.Sprintf("the last docs-rag job %s ingested another plan", ours.ID)
+			default:
+				return *ours, false, nil
+			}
+		}
+		s.logf("%s: starting a new ingestion job", why)
+		job, err = s.run(ctx, timeout, sleep, interval)
 		return job, true, err
-	case ok && latest.Err() == nil:
-		return latest, false, nil
 	}
-	if ok {
-		s.logf("the last ingestion job %s did not complete cleanly (%s): starting a new one", latest.ID, latest.Status)
-	}
-	job, err = s.run(ctx, timeout, sleep, interval)
-	return job, true, err
 }
 
 // Err is non-nil when the job did not complete cleanly.

@@ -1,22 +1,14 @@
-//go:build bedrockagent
-
 package kbpublish
 
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockagent"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockagent/types"
 )
-
-// Build with `-tags bedrockagent` once github.com/aws/aws-sdk-go-v2/service/bedrockagent
-// is in go.mod. The constraint exists only because that module could not be
-// downloaded when this file was written; see aws_nobedrock.go.
-
-// IngestSupported is true: this build can start ingestion jobs.
-const IngestSupported = true
 
 type bedrockIngest struct {
 	client *bedrockagent.Client
@@ -30,10 +22,14 @@ func NewIngestAPI(cfg aws.Config, kbID, dsID string) IngestAPI {
 	return &bedrockIngest{client: bedrockagent.NewFromConfig(cfg), kbID: kbID, dsID: dsID}
 }
 
-func (b *bedrockIngest) Start(ctx context.Context) (Job, error) {
+func (b *bedrockIngest) Start(ctx context.Context, description string) (Job, error) {
+	if len(description) > maxDescriptionLen {
+		return Job{}, fmt.Errorf("ingestion job description is %d characters, limit is %d", len(description), maxDescriptionLen)
+	}
 	out, err := b.client.StartIngestionJob(ctx, &bedrockagent.StartIngestionJobInput{
 		KnowledgeBaseId: aws.String(b.kbID),
 		DataSourceId:    aws.String(b.dsID),
+		Description:     aws.String(description),
 	})
 	if err != nil {
 		var conflict *types.ConflictException
@@ -57,26 +53,42 @@ func (b *bedrockIngest) Get(ctx context.Context, jobID string) (Job, error) {
 	return jobFrom(out.IngestionJob), nil
 }
 
-// Latest returns the most recently started job of the data source, false when
-// the data source has never been synced.
-func (b *bedrockIngest) Latest(ctx context.Context) (Job, bool, error) {
-	out, err := b.client.ListIngestionJobs(ctx, &bedrockagent.ListIngestionJobsInput{
-		KnowledgeBaseId: aws.String(b.kbID),
-		DataSourceId:    aws.String(b.dsID),
-		MaxResults:      aws.Int32(1),
-		SortBy: &types.IngestionJobSortBy{
-			Attribute: types.IngestionJobSortByAttributeStartedAt,
-			Order:     types.SortOrderDescending,
-		},
-	})
-	if err != nil {
-		return Job{}, false, err
+// Recent returns up to n jobs of the data source, the most recently started
+// first, paging as needed.
+func (b *bedrockIngest) Recent(ctx context.Context, n int) ([]Job, error) {
+	var (
+		jobs  []Job
+		token *string
+	)
+	for len(jobs) < n {
+		out, err := b.client.ListIngestionJobs(ctx, &bedrockagent.ListIngestionJobsInput{
+			KnowledgeBaseId: aws.String(b.kbID),
+			DataSourceId:    aws.String(b.dsID),
+			MaxResults:      aws.Int32(int32(min(n-len(jobs), 100))),
+			NextToken:       token,
+			SortBy: &types.IngestionJobSortBy{
+				Attribute: types.IngestionJobSortByAttributeStartedAt,
+				Order:     types.SortOrderDescending,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, s := range out.IngestionJobSummaries {
+			jobs = append(jobs, Job{
+				ID:          aws.ToString(s.IngestionJobId),
+				Description: aws.ToString(s.Description),
+				StartedAt:   aws.ToTime(s.StartedAt),
+				Status:      string(s.Status),
+				Stats:       statsFrom(s.Statistics),
+			})
+		}
+		if out.NextToken == nil {
+			break
+		}
+		token = out.NextToken
 	}
-	if len(out.IngestionJobSummaries) == 0 {
-		return Job{}, false, nil
-	}
-	s := out.IngestionJobSummaries[0]
-	return Job{ID: aws.ToString(s.IngestionJobId), Status: string(s.Status), Stats: statsFrom(s.Statistics)}, true, nil
+	return jobs, nil
 }
 
 func statsFrom(s *types.IngestionJobStatistics) JobStats {
@@ -99,5 +111,5 @@ func jobFrom(j *types.IngestionJob) Job {
 	if j == nil {
 		return Job{}
 	}
-	return Job{ID: aws.ToString(j.IngestionJobId), Status: string(j.Status), FailureReasons: j.FailureReasons, Stats: statsFrom(j.Statistics)}
+	return Job{ID: aws.ToString(j.IngestionJobId), Description: aws.ToString(j.Description), StartedAt: aws.ToTime(j.StartedAt), Status: string(j.Status), FailureReasons: j.FailureReasons, Stats: statsFrom(j.Statistics)}
 }
