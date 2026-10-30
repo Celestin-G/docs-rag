@@ -139,6 +139,10 @@ func TestNotes(t *testing.T) {
 		{"audience", "stack", "", "", Audience{License: "ee", Deployment: "self-hosted", Experiment: true}, "(Applies to Enterprise Edition, self-hosted)", "Applies to: Enterprise Edition; self-hosted; experimental feature"},
 		{"version and audience", "stack", "v3.1", "", Audience{Numscript: "new"}, "(Applies from Stack v3.1, to new Numscript interpreter)", "Applies to: Stack v3.1 and later; new Numscript interpreter"},
 		{"nothing", "stack", "", "", Audience{}, "", ""},
+		{"lower bound at the first release restricts nothing", "stack", "v3.0", "", Audience{}, "", ""},
+		{"first-release bound kept out of a range", "stack", "v3.0", "v3.2", Audience{}, "(Applies before Stack v3.2)", "Applies to: before Stack v3.2"},
+		{"component bound at the first release", "ledger", "2.2.0", "", Audience{License: "ee"}, "(Applies to Enterprise Edition)", "Applies to: Enterprise Edition"},
+		{"widened range names the component once", "membership", "v2.0.0", "v2.3.0", Audience{}, "(Applies from membership v2.0.0, before v2.3.0)", "Applies to: membership v2.0.0 up to before v2.3.0"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := tab.Convert(tc.comp, tc.lo, tc.hi)

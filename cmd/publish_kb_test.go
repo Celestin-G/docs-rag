@@ -2,11 +2,13 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/celestingeniaut/docs-rag/internal/kbpublish"
 	"github.com/spf13/pflag"
@@ -115,5 +117,50 @@ func TestPublishKBValidationStopsBeforeAWS(t *testing.T) {
 	out, err := runPublish(t, "--docs-path", root, "--bucket", "b")
 	if err == nil || !strings.Contains(err.Error(), "validation errors") || !strings.Contains(out, "duplicate key") {
 		t.Errorf("err = %v, output:\n%s", err, out)
+	}
+}
+
+type fakeAPI struct {
+	latest   kbpublish.Job
+	latestOK bool
+	final    kbpublish.Job
+	starts   int
+}
+
+func (f *fakeAPI) Start(context.Context) (kbpublish.Job, error) { f.starts++; return f.final, nil }
+func (f *fakeAPI) Get(context.Context, string) (kbpublish.Job, error) {
+	return f.final, nil
+}
+func (f *fakeAPI) Latest(context.Context) (kbpublish.Job, bool, error) {
+	return f.latest, f.latestOK, nil
+}
+
+func TestSyncAfterPublish(t *testing.T) {
+	complete := func(id string) kbpublish.Job { return kbpublish.Job{ID: id, Status: kbpublish.StatusComplete} }
+	failedJob := kbpublish.Job{ID: "j2", Status: kbpublish.StatusFailed, FailureReasons: []string{"no access"}}
+	for _, tc := range []struct {
+		name           string
+		api            *fakeAPI
+		changed, force bool
+		starts         int
+		wantErr        bool
+		wantOut        string
+	}{
+		{"nothing changed, last job fine", &fakeAPI{latest: complete("j1"), latestOK: true}, false, false, 0, false, "no new job"},
+		{"nothing changed, last job failed", &fakeAPI{latest: kbpublish.Job{ID: "j1", Status: kbpublish.StatusFailed}, latestOK: true, final: complete("j2")}, false, false, 1, false, "Ingestion job j2: COMPLETE"},
+		{"changed: the last job is not consulted", &fakeAPI{latest: complete("j1"), latestOK: true, final: complete("j2")}, true, false, 1, false, "COMPLETE"},
+		{"forced", &fakeAPI{latest: complete("j1"), latestOK: true, final: complete("j2")}, false, true, 1, false, "COMPLETE"},
+		{"failure carries the hint", &fakeAPI{final: failedJob}, true, false, 1, true, "failure: no access"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := syncAfterPublish(t.Context(), &out, tc.api, tc.changed, tc.force, time.Millisecond, time.Minute)
+			if (err != nil) != tc.wantErr || tc.api.starts != tc.starts || !strings.Contains(out.String(), tc.wantOut) {
+				t.Errorf("err = %v starts = %d out = %q", err, tc.api.starts, out.String())
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), "re-run with") {
+				t.Errorf("error lacks the re-run hint: %v", err)
+			}
+		})
 	}
 }

@@ -18,15 +18,13 @@ type Conversion struct {
 	// Empty marks a range that collapsed (min >= below) once converted: no Stack
 	// release ships it. Both bounds are widened in that case.
 	Empty bool
+	// MinTrivial marks a lower bound at or below the first Stack release: it
+	// restricts nothing, so no phrase names it. Min keeps its value.
+	MinTrivial bool
 }
 
 // Widened reports whether any bound was widened.
 func (c Conversion) Widened() bool { return c.WidenedMin || c.WidenedBelow }
-
-// Gated reports whether the conversion carries any version constraint.
-func (c Conversion) Gated() bool {
-	return c.Min > 0 || c.Below < NoUpperBound || c.Widened()
-}
 
 // Convert converts a component's raw bounds ("" for none) to the Stack scale.
 func (t *StackTable) Convert(component, minRaw, belowRaw string) Conversion {
@@ -48,6 +46,9 @@ func (t *StackTable) Convert(component, minRaw, belowRaw string) Conversion {
 			c.WidenedBelow = true
 		}
 	}
+	if c.Min > 0 && !c.WidenedMin && c.Min <= t.firstStack() {
+		c.MinTrivial = true
+	}
 	if !c.Widened() && c.Min >= c.Below {
 		c.Empty = true
 		c.Min, c.Below = 0, NoUpperBound
@@ -67,7 +68,7 @@ func (c Conversion) fromPhrase() string {
 		return ""
 	case c.WidenedMin:
 		return c.Component + " " + c.MinRaw
-	case c.Min == 0:
+	case c.Min == 0 || c.MinTrivial:
 		return ""
 	}
 	return "Stack " + stackLabel(c.Min)
@@ -85,6 +86,18 @@ func (c Conversion) beforePhrase() string {
 	return "Stack " + stackLabel(c.Below)
 }
 
+// shortBefore drops from the "before" phrase the prefix it shares with the
+// "from" phrase ("Stack " or the component name), so ranges read "Stack v3.1 up
+// to before v3.2" and "membership 2.0.0 up to before 2.3.0".
+func (c Conversion) shortBefore(from, before string) string {
+	for _, p := range []string{"Stack ", c.Component + " "} {
+		if strings.HasPrefix(from, p) && strings.HasPrefix(before, p) {
+			return strings.TrimPrefix(before, p)
+		}
+	}
+	return before
+}
+
 // inlinePhrase is the version part of an inline note: "from Stack v3.1, before
 // v3.2". Empty when the range carries no constraint.
 func (c Conversion) inlinePhrase() string {
@@ -94,9 +107,7 @@ func (c Conversion) inlinePhrase() string {
 		parts = append(parts, "from "+from)
 	}
 	if before != "" {
-		if from != "" && strings.HasPrefix(before, "Stack ") && strings.HasPrefix(from, "Stack ") {
-			before = strings.TrimPrefix(before, "Stack ")
-		}
+		before = c.shortBefore(from, before)
 		parts = append(parts, "before "+before)
 	}
 	return strings.Join(parts, ", ")
@@ -108,9 +119,7 @@ func (c Conversion) headerPhrase() string {
 	var s string
 	switch {
 	case from != "" && before != "":
-		if strings.HasPrefix(from, "Stack ") && strings.HasPrefix(before, "Stack ") {
-			before = strings.TrimPrefix(before, "Stack ")
-		}
+		before = c.shortBefore(from, before)
 		s = from + " up to before " + before
 	case from != "":
 		s = from + " and later"
@@ -120,13 +129,13 @@ func (c Conversion) headerPhrase() string {
 		return ""
 	}
 	// Name the original bound when the page is scoped to another component, so
-	// the reader sees both scales.
+	// the reader sees both scales. Only the bounds the phrase shows are named.
 	if c.Component != "stack" && !c.Widened() {
 		var orig string
 		switch {
-		case c.MinRaw != "" && c.BelowRaw != "":
+		case from != "" && before != "":
 			orig = c.MinRaw + " up to before " + c.BelowRaw
-		case c.MinRaw != "":
+		case from != "":
 			orig = c.MinRaw + " and later"
 		default:
 			orig = "before " + c.BelowRaw

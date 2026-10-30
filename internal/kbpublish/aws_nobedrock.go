@@ -28,5 +28,6 @@ type noBedrock struct{}
 // NewIngestAPI returns an IngestAPI that fails every call.
 func NewIngestAPI(aws.Config, string, string) IngestAPI { return noBedrock{} }
 
-func (noBedrock) Start(context.Context) (Job, error)       { return Job{}, errNoBedrock }
-func (noBedrock) Get(context.Context, string) (Job, error) { return Job{}, errNoBedrock }
+func (noBedrock) Start(context.Context) (Job, error)        { return Job{}, errNoBedrock }
+func (noBedrock) Get(context.Context, string) (Job, error)  { return Job{}, errNoBedrock }
+func (noBedrock) Latest(context.Context) (Job, bool, error) { return Job{}, false, errNoBedrock }

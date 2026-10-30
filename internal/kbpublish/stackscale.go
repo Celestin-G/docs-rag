@@ -36,6 +36,16 @@ type StackTable struct {
 	ledger []release // Ledger releases: carry the numscript-interpreter ceiling
 }
 
+// firstStack is the Stack-scale number of the first Stack release, 0 when the
+// table is empty.
+func (t *StackTable) firstStack() int {
+	if len(t.stack) == 0 {
+		return 0
+	}
+	scale, _ := stackScale(t.stack[0].version)
+	return scale
+}
+
 // Releases returns the Stack versions of the table, in order, for reporting.
 func (t *StackTable) Releases() []string {
 	out := make([]string, len(t.stack))

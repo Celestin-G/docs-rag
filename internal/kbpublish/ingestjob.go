@@ -51,6 +51,9 @@ type IngestAPI interface {
 	// Start starts a job and returns ErrIngestConflict when one is running.
 	Start(ctx context.Context) (Job, error)
 	Get(ctx context.Context, jobID string) (Job, error)
+	// Latest returns the most recently started job of the data source (without
+	// failure reasons), false when there is none.
+	Latest(ctx context.Context) (Job, bool, error)
 }
 
 // Syncer runs an ingestion job to the end.
@@ -79,10 +82,9 @@ func (s *Syncer) logf(format string, args ...any) {
 	}
 }
 
-// Run starts one ingestion job and waits for it, for at most timeout. A start
-// that hits a running job is retried until the timeout. It returns an error when
-// the job does not complete, or completes with failed documents.
-func (s *Syncer) Run(ctx context.Context, timeout time.Duration) (Job, error) {
+// timed returns the context bounded by timeout, the sleep function and the
+// polling interval.
+func (s *Syncer) timed(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc, func(context.Context, time.Duration) error, time.Duration) {
 	sleep := s.Sleep
 	if sleep == nil {
 		sleep = sleepCtx
@@ -92,8 +94,19 @@ func (s *Syncer) Run(ctx context.Context, timeout time.Duration) (Job, error) {
 		interval = 10 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	return ctx, cancel, sleep, interval
+}
 
+// Run starts one ingestion job and waits for it, for at most timeout. A start
+// that hits a running job is retried until the timeout. It returns an error when
+// the job does not complete, or completes with failed documents.
+func (s *Syncer) Run(ctx context.Context, timeout time.Duration) (Job, error) {
+	ctx, cancel, sleep, interval := s.timed(ctx, timeout)
+	defer cancel()
+	return s.run(ctx, timeout, sleep, interval)
+}
+
+func (s *Syncer) run(ctx context.Context, timeout time.Duration, sleep func(context.Context, time.Duration) error, interval time.Duration) (Job, error) {
 	var job Job
 	for {
 		var err error
@@ -110,7 +123,11 @@ func (s *Syncer) Run(ctx context.Context, timeout time.Duration) (Job, error) {
 		}
 	}
 	s.logf("ingestion job %s started", job.ID)
+	return s.wait(ctx, job, timeout, sleep, interval)
+}
 
+// wait polls the job to a terminal state and returns its error, if any.
+func (s *Syncer) wait(ctx context.Context, job Job, timeout time.Duration, sleep func(context.Context, time.Duration) error, interval time.Duration) (Job, error) {
 	for !job.Terminal() {
 		if err := sleep(ctx, interval); err != nil {
 			return job, fmt.Errorf("ingestion job %s still %s after %s: %w", job.ID, job.Status, timeout, err)
@@ -122,11 +139,35 @@ func (s *Syncer) Run(ctx context.Context, timeout time.Duration) (Job, error) {
 		job = next
 		s.logf("ingestion job %s: %s", job.ID, job.Status)
 	}
+	return job, job.Err()
+}
 
-	if err := job.Err(); err != nil {
-		return job, err
+// RunIfStale is for a publish that changed nothing in the bucket. The knowledge
+// base is still stale when the previous ingestion failed or timed out, so it
+// looks at the latest job of the data source: one still running is waited for,
+// one that completed with no failed document means nothing to do (ran is
+// false), anything else (failed, stopped, failed documents, no job at all)
+// starts a new job.
+func (s *Syncer) RunIfStale(ctx context.Context, timeout time.Duration) (job Job, ran bool, err error) {
+	ctx, cancel, sleep, interval := s.timed(ctx, timeout)
+	defer cancel()
+	latest, ok, err := s.API.Latest(ctx)
+	if err != nil {
+		return Job{}, false, fmt.Errorf("list ingestion jobs: %w", err)
 	}
-	return job, nil
+	switch {
+	case ok && !latest.Terminal():
+		s.logf("ingestion job %s is still %s, waiting for it", latest.ID, latest.Status)
+		job, err = s.wait(ctx, latest, timeout, sleep, interval)
+		return job, true, err
+	case ok && latest.Err() == nil:
+		return latest, false, nil
+	}
+	if ok {
+		s.logf("the last ingestion job %s did not complete cleanly (%s): starting a new one", latest.ID, latest.Status)
+	}
+	job, err = s.run(ctx, timeout, sleep, interval)
+	return job, true, err
 }
 
 // Err is non-nil when the job did not complete cleanly.

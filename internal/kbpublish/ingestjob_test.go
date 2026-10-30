@@ -15,6 +15,14 @@ type fakeIngest struct {
 	starts    int
 	gets      int
 	getErr    error
+
+	latest    Job // returned by Latest
+	latestOK  bool
+	latestErr error
+}
+
+func (f *fakeIngest) Latest(context.Context) (Job, bool, error) {
+	return f.latest, f.latestOK, f.latestErr
 }
 
 func (f *fakeIngest) Start(context.Context) (Job, error) {
@@ -67,6 +75,39 @@ func TestSyncerRun(t *testing.T) {
 			}
 			if tc.wantErr == "" && job.Status != StatusComplete {
 				t.Errorf("status = %s", job.Status)
+			}
+		})
+	}
+}
+
+func TestRunIfStale(t *testing.T) {
+	boom := errors.New("boom")
+	complete := Job{ID: "new", Status: StatusComplete}
+	for _, tc := range []struct {
+		name    string
+		api     *fakeIngest
+		ran     bool
+		wantErr string
+		starts  int
+		gets    int
+	}{
+		{"last job complete: nothing to do", &fakeIngest{latest: Job{ID: "old", Status: StatusComplete}, latestOK: true}, false, "", 0, 0},
+		{"no job ever: start one", &fakeIngest{states: []Job{complete}}, true, "", 1, 0},
+		{"last job failed: start one", &fakeIngest{latest: Job{ID: "old", Status: StatusFailed}, latestOK: true, states: []Job{complete}}, true, "", 1, 0},
+		{"last job stopped: start one", &fakeIngest{latest: Job{ID: "old", Status: StatusStopped}, latestOK: true, states: []Job{complete}}, true, "", 1, 0},
+		{"last job completed with failed documents: start one", &fakeIngest{latest: Job{ID: "old", Status: StatusComplete, Stats: JobStats{Failed: 1}}, latestOK: true, states: []Job{complete}}, true, "", 1, 0},
+		{"last job running: wait, do not start", &fakeIngest{latest: Job{ID: "old", Status: StatusInProgress}, latestOK: true, states: []Job{{}, {ID: "old", Status: StatusComplete}}}, true, "", 0, 1},
+		{"running job then fails", &fakeIngest{latest: Job{ID: "old", Status: StatusStarting}, latestOK: true, states: []Job{{}, {ID: "old", Status: StatusFailed}}}, true, "ended FAILED", 0, 1},
+		{"list error", &fakeIngest{latestErr: boom}, false, "list ingestion jobs: boom", 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Syncer{API: tc.api, Sleep: noSleep}
+			_, ran, err := s.RunIfStale(t.Context(), time.Hour)
+			if tc.wantErr == "" && err != nil || tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Errorf("err = %v, want %q", err, tc.wantErr)
+			}
+			if ran != tc.ran || tc.api.starts != tc.starts || tc.api.gets != tc.gets {
+				t.Errorf("ran %v starts %d gets %d, want %v %d %d", ran, tc.api.starts, tc.api.gets, tc.ran, tc.starts, tc.gets)
 			}
 		})
 	}

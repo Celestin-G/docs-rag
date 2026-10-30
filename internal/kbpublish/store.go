@@ -117,7 +117,7 @@ func (d *Diff) Changes() bool {
 }
 
 // ComputeDiff compares the wanted files with the bucket. It lists everything
-// under docs/ and reads the sha256 metadata of the bodies that exist on both
+// under docs/ and reads the sha256 metadata of the bodies and sidecars that exist on both
 // sides, a few at a time.
 func ComputeDiff(ctx context.Context, store ObjectStore, files []File, concurrency int) (*Diff, error) {
 	if concurrency < 1 {
@@ -149,7 +149,7 @@ func ComputeDiff(ctx context.Context, store ObjectStore, files []File, concurren
 		}
 	}
 
-	hashes := make([]string, len(toCheck))
+	hashes := make([][2]string, len(toCheck)) // body, sidecar
 	errs := make([]error, len(toCheck))
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
@@ -157,7 +157,9 @@ func ComputeDiff(ctx context.Context, store ObjectStore, files []File, concurren
 		sem <- struct{}{}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			hashes[i], errs[i] = store.Hash(ctx, f.Key)
+			bodyHash, err1 := store.Hash(ctx, f.Key)
+			sideHash, err2 := store.Hash(ctx, SidecarKey(f.Key))
+			hashes[i], errs[i] = [2]string{bodyHash, sideHash}, errors.Join(err1, err2)
 		})
 	}
 	wg.Wait()
@@ -165,7 +167,8 @@ func ComputeDiff(ctx context.Context, store ObjectStore, files []File, concurren
 		return nil, fmt.Errorf("read object metadata: %w", err)
 	}
 	for i, f := range toCheck {
-		if hashes[i] == f.Hash {
+		// A missing hash on either object counts as a mismatch.
+		if hashes[i][0] == f.Hash && hashes[i][1] == f.Hash {
 			d.Unchanged++
 		} else {
 			d.Changed = append(d.Changed, f.Key)

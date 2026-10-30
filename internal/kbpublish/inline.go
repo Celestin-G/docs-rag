@@ -132,17 +132,20 @@ func RewriteInline(rel string, raw []byte, t *StackTable) ([]byte, InlineReport)
 		}
 
 		if m := docCaseRe.FindStringSubmatch(trimmed); m != nil {
+			note := ""
 			switch m[1] {
 			case "ee":
-				out = append(out, "(Enterprise Edition)", "")
-				rep.DocCaseNotes++
-				continue
+				note = "(Enterprise Edition)"
 			case "oss":
-				out = append(out, "(Open source edition)", "")
-				rep.DocCaseNotes++
+				note = "(Open source edition)"
+			default:
+				out = append(out, line)
 				continue
 			}
-			out = append(out, line)
+			if blockHasText(lines, i, "</DocCase>") {
+				out = append(out, note, "")
+				rep.DocCaseNotes++
+			}
 			continue
 		}
 
@@ -188,16 +191,75 @@ func RewriteInline(rel string, raw []byte, t *StackTable) ([]byte, InlineReport)
 			aud = audienceFrom(visibilityValues(m[1]))
 		}
 		conv := t.Convert(comp, get(minimumAtt), get(belowAtt))
+		note := InlineNote(conv, aud)
+		// A block that produces no text (only components the chunker strips) gets
+		// no note: it would dangle in front of the next paragraph.
+		if (note != "" || conv.Widened()) && !blockHasText(lines, i, "</When>") {
+			continue
+		}
 		if conv.Widened() {
 			rep.Widened = append(rep.Widened, widening(rel, true, conv))
 		}
-		if note := InlineNote(conv, aud); note != "" {
+		if note != "" {
 			out = append(out, note, "")
 			rep.WhenNotes++
 		}
 		// A block that constrains nothing loses its tag line, as the chunker does.
 	}
 	return []byte(strings.Join(out, "\n")), rep
+}
+
+var (
+	strippedTagRe = regexp.MustCompile(`</?[A-Z][A-Za-z.]*(?:\s[^>]*)?>|</?div(?:\s[^>]*)?>`)
+	jsxOpenRe     = regexp.MustCompile(`^<[A-Z][A-Za-z.]*`)
+)
+
+// blockHasText reports whether the block opened on lines[open], up to its
+// closing tag, keeps any text once the chunker has stripped the JSX components
+// (it mirrors chunker.stripMDX). A block with no closing tag is assumed to have
+// text, so a note is never dropped on a guess.
+func blockHasText(lines []string, open int, closeTag string) bool {
+	end := -1
+	depth := 1
+	for j := open + 1; j < len(lines); j++ {
+		t := strings.TrimSpace(lines[j])
+		if closeTag == "</When>" && isWhenOpen(t) {
+			depth++
+		}
+		if strings.HasPrefix(t, closeTag) {
+			if depth--; depth == 0 {
+				end = j
+				break
+			}
+		}
+	}
+	if end < 0 {
+		return true
+	}
+	skipToClose := false
+	for _, line := range lines[open+1 : end] {
+		t := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(t, "```"):
+			return true
+		case skipToClose:
+			if strings.HasSuffix(t, ">") {
+				skipToClose = false
+			}
+			continue
+		case strings.HasPrefix(t, "import ") && strings.Contains(t, " from "):
+			continue
+		case strings.Contains(t, "<DocAPI.Fctl"), strings.Contains(t, "<DocCard"):
+			return true // the chunker keeps the command or the card title
+		case jsxOpenRe.MatchString(t) && !strings.HasSuffix(t, ">"):
+			skipToClose = true
+			continue
+		}
+		if strings.TrimSpace(strippedTagRe.ReplaceAllString(line, "")) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // isWhenOpen reports whether a trimmed line starts a <When> opening tag (and not

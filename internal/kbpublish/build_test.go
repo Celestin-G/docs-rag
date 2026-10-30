@@ -125,6 +125,29 @@ func TestSplitBody(t *testing.T) {
 	}
 }
 
+func TestSplitBodyKeepsFencesBalanced(t *testing.T) {
+	code := strings.Repeat("let x = 1\n\nlet y = 2\n", 30) // blank lines inside the block
+	text := "Intro paragraph.\n\n```go title=\"a.go\"\n" + code + "```\n\nOutro."
+	parts := splitBody(text, 300)
+	if len(parts) < 3 {
+		t.Fatalf("expected a re-split, got %d parts", len(parts))
+	}
+	for i, p := range parts {
+		if len(p) > 300 {
+			t.Errorf("part %d is %d bytes", i, len(p))
+		}
+		if n := strings.Count(p, "\n```") + strings.Count(p[:3], "```"); n%2 != 0 {
+			t.Errorf("part %d has an unbalanced fence:\n%s", i, p)
+		}
+	}
+	if !strings.HasPrefix(parts[1], "```go title=\"a.go\"\n") {
+		t.Errorf("second part does not reopen the fence with its info string:\n%s", parts[1])
+	}
+	if last := parts[len(parts)-1]; !strings.HasSuffix(last, "Outro.") || strings.Count(strings.Join(parts, "\n"), "```")%2 != 0 {
+		t.Errorf("last part = %q", last)
+	}
+}
+
 func TestGlobMatch(t *testing.T) {
 	for _, tc := range []struct {
 		glob, name string
@@ -356,6 +379,21 @@ func TestBuildKeysStayUnderDocs(t *testing.T) {
 	for _, f := range p.Files {
 		if !strings.HasPrefix(f.Key, "docs/other/") || len(ValidateKey(f.Key)) != 0 {
 			t.Errorf("key %q escapes docs/other/ or is invalid: %v", f.Key, ValidateKey(f.Key))
+		}
+	}
+}
+
+func TestDefaultExcludes(t *testing.T) {
+	for rel, want := range map[string]bool{
+		"apps/docs/content/data/generated/stack.oas.json":             true,
+		"apps/docs/content/data/generated/stack.oas.enriched.json":    true,
+		"apps/docs/content/data/generated/stack.oas.prose.json":       true,
+		"apps/docs/content/data/generated/membership.oas.json":        true,
+		"apps/docs/content/data/generated/api.operations.json":        false,
+		"apps/docs/content/data/generated/membership.operations.json": false,
+	} {
+		if got := excluded(rel, DefaultExcludes); got != want {
+			t.Errorf("excluded(%q) = %v, want %v", rel, got, want)
 		}
 	}
 }

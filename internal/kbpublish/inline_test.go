@@ -49,6 +49,12 @@ func TestRewriteInline(t *testing.T) {
 			name: "constrains nothing", in: "<When component=\"ledger\">\nx\n</When>",
 			want: []string{"x"}, notWant: []string{"Applies"},
 		},
+		{
+			name: "block with only a stripped component gets no note", in: "<When component=\"membership\" minimum=\"v2.0.0\">\n<DocAPI method=\"POST\" path=\"/x\"\n  body={{ a: 1 }} />\n</When>\n\nAfter.",
+			want: []string{"After."}, notWant: []string{"Applies"},
+		},
+		{name: "doc case with only a stripped component gets no note", in: "<DocCase value=\"ee\">\n<DocAPI path=\"/x\" />\n</DocCase>\nAfter.", want: []string{"After."}, notWant: []string{"Enterprise"}},
+		{name: "unclosed block keeps its note", in: "<When component=\"stack\" minimum=\"v3.2\">\n<DocAPI path=\"/x\" />", want: []string{"(Applies from Stack v3.2)"}, when: 1},
 		{name: "doc case ee", in: "<DocCase value=\"ee\">\nx\n</DocCase>", want: []string{"(Enterprise Edition)"}, dc: 1},
 		{name: "doc case oss", in: "<DocCase value=\"oss\">\nx\n</DocCase>", want: []string{"(Open source edition)"}, dc: 1},
 		{name: "doc case other value untouched", in: "<DocCase value=\"go\">\nx", want: []string{"<DocCase value=\"go\">"}},

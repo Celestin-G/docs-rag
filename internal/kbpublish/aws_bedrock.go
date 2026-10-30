@@ -57,21 +57,47 @@ func (b *bedrockIngest) Get(ctx context.Context, jobID string) (Job, error) {
 	return jobFrom(out.IngestionJob), nil
 }
 
+// Latest returns the most recently started job of the data source, false when
+// the data source has never been synced.
+func (b *bedrockIngest) Latest(ctx context.Context) (Job, bool, error) {
+	out, err := b.client.ListIngestionJobs(ctx, &bedrockagent.ListIngestionJobsInput{
+		KnowledgeBaseId: aws.String(b.kbID),
+		DataSourceId:    aws.String(b.dsID),
+		MaxResults:      aws.Int32(1),
+		SortBy: &types.IngestionJobSortBy{
+			Attribute: types.IngestionJobSortByAttributeStartedAt,
+			Order:     types.SortOrderDescending,
+		},
+	})
+	if err != nil {
+		return Job{}, false, err
+	}
+	if len(out.IngestionJobSummaries) == 0 {
+		return Job{}, false, nil
+	}
+	s := out.IngestionJobSummaries[0]
+	return Job{ID: aws.ToString(s.IngestionJobId), Status: string(s.Status), Stats: statsFrom(s.Statistics)}, true, nil
+}
+
+func statsFrom(s *types.IngestionJobStatistics) JobStats {
+	if s == nil {
+		return JobStats{}
+	}
+	// The counters are plain int64 in the SDK, not pointers.
+	return JobStats{
+		Scanned:          s.NumberOfDocumentsScanned,
+		NewIndexed:       s.NumberOfNewDocumentsIndexed,
+		Modified:         s.NumberOfModifiedDocumentsIndexed,
+		Deleted:          s.NumberOfDocumentsDeleted,
+		Failed:           s.NumberOfDocumentsFailed,
+		MetadataScanned:  s.NumberOfMetadataDocumentsScanned,
+		MetadataModified: s.NumberOfMetadataDocumentsModified,
+	}
+}
+
 func jobFrom(j *types.IngestionJob) Job {
 	if j == nil {
 		return Job{}
 	}
-	job := Job{ID: aws.ToString(j.IngestionJobId), Status: string(j.Status), FailureReasons: j.FailureReasons}
-	if s := j.Statistics; s != nil {
-		job.Stats = JobStats{
-			Scanned:          aws.ToInt64(s.NumberOfDocumentsScanned),
-			NewIndexed:       aws.ToInt64(s.NumberOfNewDocumentsIndexed),
-			Modified:         aws.ToInt64(s.NumberOfModifiedDocumentsIndexed),
-			Deleted:          aws.ToInt64(s.NumberOfDocumentsDeleted),
-			Failed:           aws.ToInt64(s.NumberOfDocumentsFailed),
-			MetadataScanned:  aws.ToInt64(s.NumberOfMetadataDocumentsScanned),
-			MetadataModified: aws.ToInt64(s.NumberOfMetadataDocumentsModified),
-		}
-	}
-	return job
+	return Job{ID: aws.ToString(j.IngestionJobId), Status: string(j.Status), FailureReasons: j.FailureReasons, Stats: statsFrom(j.Statistics)}
 }

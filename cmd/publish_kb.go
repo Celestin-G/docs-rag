@@ -1,11 +1,14 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -39,7 +42,8 @@ func init() {
 	f.Bool("allow-mass-delete", false, "Allow deleting more than 20% of the existing objects")
 	f.Bool("force-sync", false, "Start an ingestion job even when nothing changed")
 	f.Duration("timeout", 30*time.Minute, "How long to wait for the ingestion job")
-	f.StringArray("exclude", nil, "Glob on repo-relative paths to leave out (repeatable), e.g. 'apps/docs/content/data/generated/stack.oas*.json'")
+	f.StringArray("exclude", nil, "Glob on repo-relative paths to leave out, added to the default excludes (repeatable). Excluding a file that is already published deletes it from the bucket (subject to the 20% delete guard)")
+	f.Bool("no-default-excludes", false, "Publish the raw OpenAPI dumps too ("+strings.Join(kbpublish.DefaultExcludes, ", ")+")")
 	f.Bool("verbose", false, "List every key of the diff")
 	rootCmd.AddCommand(publishKBCmd)
 }
@@ -65,6 +69,10 @@ func runPublishKB(cmd *cobra.Command, _ []string) error {
 	force, _ := fl.GetBool("force-sync")
 	timeout, _ := fl.GetDuration("timeout")
 	excludes, _ := fl.GetStringArray("exclude")
+	noDefault, _ := fl.GetBool("no-default-excludes")
+	if !noDefault {
+		excludes = append(slices.Clone(kbpublish.DefaultExcludes), excludes...)
+	}
 	verbose, _ := fl.GetBool("verbose")
 
 	docsPath := envDefault(cmd, "docs-path", "DOCS_PATH", "")
@@ -130,6 +138,14 @@ func runPublishKB(cmd *cobra.Command, _ []string) error {
 	plan := kbpublish.Build(sources, kbpublish.Options{Table: table, Dates: dates, Excludes: excludes})
 	stdout := cmd.OutOrStdout()
 	plan.Report.PrintSummary(stdout, table)
+	if len(excludes) > 0 {
+		fmt.Fprintf(stdout, "\nActive excludes (%d files left out):\n", plan.Report.Excluded)
+		for _, e := range excludes {
+			fmt.Fprintf(stdout, "  %s\n", e)
+		}
+	} else {
+		fmt.Fprintln(stdout, "\nActive excludes: none")
+	}
 
 	if len(plan.Report.ParseFailures) > 0 {
 		return fmt.Errorf("%d files failed to parse: nothing published", len(plan.Report.ParseFailures))
@@ -207,14 +223,37 @@ func publish(cmd *cobra.Command, w io.Writer, store kbpublish.ObjectStore, plan 
 	}
 	fmt.Fprintf(w, "\nUploaded %d files, deleted %d objects.\n", len(diff.New)+len(diff.Changed), len(diff.DeleteKeys()))
 
-	if !diff.Changes() && !forceSync {
-		fmt.Fprintln(w, "Nothing changed: no ingestion job started (--force-sync to start one anyway).")
+	return syncAfterPublish(ctx, w, kbpublish.NewIngestAPI(cfg, kbID, dsID), diff.Changes(), forceSync, 10*time.Second, timeout)
+}
+
+// forceSyncHint is added to every ingestion failure.
+const forceSyncHint = "re-run with --force-sync to start a new ingestion job"
+
+// syncAfterPublish starts the ingestion job a publish needs. When the bucket
+// changed (or a sync is forced) it always starts one. Otherwise the knowledge
+// base can still be stale from an earlier failed or timed-out job, so the latest
+// job decides (see Syncer.RunIfStale).
+func syncAfterPublish(ctx context.Context, w io.Writer, api kbpublish.IngestAPI, changed, forced bool, poll, timeout time.Duration) error {
+	syncer := &kbpublish.Syncer{API: api, PollInterval: poll, Log: os.Stderr}
+	var (
+		job kbpublish.Job
+		ran = true
+		err error
+	)
+	if changed || forced {
+		job, err = syncer.Run(ctx, timeout)
+	} else {
+		job, ran, err = syncer.RunIfStale(ctx, timeout)
+	}
+	if err == nil && !ran {
+		fmt.Fprintf(w, "Nothing changed and the latest ingestion job %s completed: no new job (use the force-sync flag to start one anyway).\n", job.ID)
 		return nil
 	}
-	syncer := &kbpublish.Syncer{API: kbpublish.NewIngestAPI(cfg, kbID, dsID), PollInterval: 10 * time.Second, Log: os.Stderr}
-	job, err := syncer.Run(ctx, timeout)
 	if job.ID != "" {
 		fmt.Fprint(w, job.Summary())
 	}
-	return err
+	if err != nil {
+		return fmt.Errorf("%w (%s)", err, forceSyncHint)
+	}
+	return nil
 }

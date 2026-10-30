@@ -20,6 +20,16 @@ const maxFileBytes = 1800
 // minPartBudget keeps a very long breadcrumb from squeezing the body to nothing.
 const minPartBudget = 400
 
+// DefaultExcludes are left out unless --no-default-excludes is passed: the raw
+// OpenAPI dumps. The same API is published in readable form (the api.operations,
+// api.schemas and membership.operations datasets).
+var DefaultExcludes = []string{
+	"apps/docs/content/data/generated/stack.oas.json",
+	"apps/docs/content/data/generated/stack.oas.enriched.json",
+	"apps/docs/content/data/generated/stack.oas.prose.json",
+	"apps/docs/content/data/generated/membership.oas.json",
+}
+
 // SourceFile is one documentation file read from the docs checkout.
 type SourceFile struct {
 	Rel     string // slash path relative to the docs root
@@ -511,8 +521,69 @@ func (fc *fileContext) anchor(c chunker.Chunk) string {
 }
 
 // splitBody cuts text into parts of at most budget bytes on paragraph, then
-// line, then word boundaries.
+// line, then word boundaries. A cut inside a fenced code block closes the fence
+// at the end of the part and reopens it (same info string) at the start of the
+// next, so no part has an unbalanced fence.
 func splitBody(text string, budget int) []string {
+	if !strings.Contains(text, "```") {
+		return cutBody(text, budget)
+	}
+	// Room for the closing fence and the longest opening fence of the text.
+	overhead := 4
+	for line := range strings.SplitSeq(text, "\n") {
+		if t := strings.TrimSpace(line); strings.HasPrefix(t, "```") {
+			overhead = max(overhead, len(t)+len("\n```")+1)
+		}
+	}
+	parts := cutBody(text, max(budget-overhead, budget/2))
+	var (
+		out     []string
+		opening string // the opening fence line while inside a fence
+	)
+	for i, part := range parts {
+		if opening != "" {
+			// The previous part closed the fence for us: a stray closing line at
+			// the top of this one is dropped, anything else reopens it.
+			first, rest, _ := strings.Cut(part, "\n")
+			if isFenceClose(first, opening) {
+				opening = ""
+				part = strings.TrimSpace(rest)
+				if part == "" {
+					continue
+				}
+			} else {
+				part = opening + "\n" + part
+			}
+		}
+		for line := range strings.SplitSeq(part, "\n") {
+			t := strings.TrimSpace(line)
+			switch {
+			case opening == "" && strings.HasPrefix(t, "```"):
+				opening = t
+			case opening != "" && isFenceClose(t, opening):
+				opening = ""
+			}
+		}
+		if opening != "" && i < len(parts)-1 {
+			part += "\n" + fenceMarker(opening)
+		}
+		out = append(out, part)
+	}
+	return out
+}
+
+// fenceMarker returns the run of backticks that opens a fence line.
+func fenceMarker(open string) string {
+	return open[:len(open)-len(strings.TrimLeft(open, "`"))]
+}
+
+// isFenceClose reports whether line closes the fence opened by open.
+func isFenceClose(line, open string) bool {
+	t := strings.TrimSpace(line)
+	return t != "" && strings.Trim(t, "`") == "" && len(t) >= len(fenceMarker(open))
+}
+
+func cutBody(text string, budget int) []string {
 	var parts []string
 	var cur strings.Builder
 	flush := func() {

@@ -79,16 +79,17 @@ func TestNewFileHash(t *testing.T) {
 
 func TestComputeDiff(t *testing.T) {
 	same, changed, fresh := file("docs/s.md", "same"), file("docs/c.md", "new text"), file("docs/n.md", "n")
-	half := file("docs/h.md", "half")
+	half, sideStale := file("docs/h.md", "half"), file("docs/x.md", "side")
 	store := newMem(map[string]string{
 		"docs/s.md": same.Hash, "docs/s.md" + sidecarSuffix: same.Hash,
 		"docs/c.md": "stale", "docs/c.md" + sidecarSuffix: "stale",
-		"docs/h.md":    half.Hash, // sidecar missing: half an upload
+		"docs/h.md": half.Hash,                                            // sidecar missing: half an upload
+		"docs/x.md": sideStale.Hash, "docs/x.md" + sidecarSuffix: "stale", // body fine, sidecar hash differs
 		"docs/gone.md": "x", "docs/gone.md" + sidecarSuffix: "x",
 		"docs/orphan.md" + sidecarSuffix: "x",
 		"docs/notes.txt":                 "x",
 	})
-	d, err := ComputeDiff(t.Context(), store, []File{same, changed, fresh, half}, 2)
+	d, err := ComputeDiff(t.Context(), store, []File{same, changed, fresh, half, sideStale}, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,12 +100,12 @@ func TestComputeDiff(t *testing.T) {
 		}
 	}
 	check("new", d.New, []string{"docs/n.md"})
-	check("changed", d.Changed, []string{"docs/c.md", "docs/h.md"})
+	check("changed", d.Changed, []string{"docs/c.md", "docs/h.md", "docs/x.md"})
 	check("deleted", d.Deleted, []string{"docs/gone.md"})
 	check("orphans", d.OrphanSidecars, []string{"docs/orphan.md" + sidecarSuffix})
 	check("others", d.Others, []string{"docs/notes.txt"})
 	check("delete keys", d.DeleteKeys(), []string{"docs/gone.md", "docs/gone.md" + sidecarSuffix, "docs/notes.txt", "docs/orphan.md" + sidecarSuffix})
-	if d.Unchanged != 1 || d.Existing != 9 || !d.Changes() {
+	if d.Unchanged != 1 || d.Existing != 11 || !d.Changes() {
 		t.Errorf("unchanged %d existing %d", d.Unchanged, d.Existing)
 	}
 }
