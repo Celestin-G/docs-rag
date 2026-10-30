@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Fake `aws` CLI for scripts/kb-verify.sh tests. Never talks to AWS.
+# Env: FAKE_AWS_DIR (state dir, required; every call is logged to calls.log)
+#      FAKE_AWS_SCENARIO: happy | leak (ignores the filter) | numeric_reject | no_later | retrieve_fail | kb_missing
+set -euo pipefail
+
+state="${FAKE_AWS_DIR:?}"
+scenario="${FAKE_AWS_SCENARIO:-happy}"
+printf '%s\n' "$*" >>"${state}/calls.log"
+
+arg_after() {
+  local flag="$1"
+  shift
+  while [ $# -gt 1 ]; do
+    if [ "$1" = "${flag}" ]; then
+      printf '%s' "$2"
+      return 0
+    fi
+    shift
+  done
+}
+
+# Some numbers are strings on purpose: the API may return either.
+corpus() {
+  jq -nc '[
+    {s:0.91, u:"https://docs.formance.com/modules/payments/connectors", m:{product:"payments",deployment:"any",license:"any",client_id:"none",version_min:0,version_below:99999}},
+    {s:0.88, u:"https://docs.formance.com/modules/payments/new-api", m:{product:"payments",deployment:"any",license:"any",client_id:"none",version_min:302,version_below:99999}},
+    {s:0.85, u:"https://docs.formance.com/deploy/cloud-regions", m:{product:"stack",deployment:"cloud",license:"any",client_id:"none",version_min:"0",version_below:"99999"}},
+    {s:0.80, u:"https://docs.formance.com/deploy/helm", m:{product:"stack",deployment:"self-hosted",license:"any",client_id:"none",version_min:0,version_below:99999}},
+    {s:0.78, u:"https://docs.formance.com/manage/sso", m:{product:"stack",deployment:"any",license:"ee",client_id:"none",version_min:0,version_below:99999}},
+    {s:0.70, u:"https://docs.formance.com/manage/oss-auth", m:{product:"stack",deployment:"any",license:"oss",client_id:"none",version_min:0,version_below:99999}},
+    {s:0.66, u:"https://docs.formance.com/modules/payments/legacy", m:{product:"payments",deployment:"any",license:"any",client_id:"none",version_min:0,version_below:301}},
+    {s:0.60, u:"https://docs.formance.com/tickets/acme-1", m:{product:"stack",deployment:"any",license:"any",client_id:"acme",version_min:0,version_below:99999}}
+  ]'
+}
+
+retrieve() {
+  local cfg
+  cfg="$(arg_after --retrieval-configuration "$@")"
+  if [ "${scenario}" = "retrieve_fail" ]; then
+    echo "An error occurred (ThrottlingException) when calling the Retrieve operation" >&2
+    exit 254
+  fi
+  if [ "${scenario}" = "numeric_reject" ] && grep -Eq 'lessThanOrEquals|greaterThan' <<<"${cfg}"; then
+    echo "An error occurred (ValidationException) when calling the Retrieve operation: unsupported filter operator" >&2
+    exit 254
+  fi
+  corpus | jq -c --argjson cfg "${cfg}" --arg scenario "${scenario}" '
+    def num: if type == "string" then tonumber else . end;
+    def ev($m):
+      if has("andAll") then all(.andAll[]; ev($m))
+      elif has("in") then (.in as $e | any($e.value[]; . == $m[$e.key]))
+      elif has("lessThanOrEquals") then (.lessThanOrEquals as $e | ($m[$e.key] | num) <= $e.value)
+      elif has("greaterThan") then (.greaterThan as $e | ($m[$e.key] | num) > $e.value)
+      else error("unsupported filter") end;
+    $cfg.vectorSearchConfiguration as $v
+    | [.[] | select($scenario == "leak" or (.m as $m | $v.filter | ev($m)))
+           | select($scenario != "no_later" or ((.m.version_min | num) <= 301))]
+    | .[:$v.numberOfResults]
+    | {retrievalResults: [.[] | {content: {text: "fake"}, score: .s,
+        location: {type: "S3", s3Location: {uri: "s3://fake-bucket/docs/x.md"}},
+        metadata: (.m + {source_url: .u})}]}'
+}
+
+case "${1:-} ${2:-}" in
+  "bedrock-agent-runtime retrieve") shift 2; retrieve "$@" ;;
+  "bedrock-agent get-knowledge-base")
+    if [ "${scenario}" = "kb_missing" ]; then
+      echo "An error occurred (ResourceNotFoundException) when calling the GetKnowledgeBase operation" >&2
+      exit 254
+    fi
+    echo '{"knowledgeBase":{"name":"support-kb-test","status":"ACTIVE"}}'
+    ;;
+  *)
+    echo "fake aws: unexpected command: $*" >&2
+    exit 99
+    ;;
+esac
