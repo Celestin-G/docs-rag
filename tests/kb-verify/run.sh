@@ -95,6 +95,26 @@ test_numeric_rejected() {
   check "rejected: tests 2 and 3 still run" "$(has 'PASS: 2a' && has 'PASS: 3b' && echo 0 || echo 1)"
 }
 
+test_numeric_other_error() {
+  run_case numeric_other_error
+  check "other error: exit 1" "$([ "${RC}" -eq 1 ] && echo 0 || echo 1)"
+  check "other error: no banner" "$(no 'NUMERIC FILTERS NOT SUPPORTED')"
+  check "other error: reported as retrieve failed" "$(yes 'FAIL: 1b X=301: retrieve failed: .*AccessDeniedException')"
+}
+
+test_numeric_empty() {
+  run_case numeric_empty
+  check "numeric_empty: FAIL, exit 1" "$([ "${RC}" -eq 1 ] && has 'FAIL: 1b/1c: numeric filter matched nothing although matching content exists; numbers may be stored as strings' && echo 0 || echo 1)"
+  check "numeric_empty: no inconclusive INFO for 1b/1c" "$(no 'INFO: 1[bc] X=')"
+}
+
+test_client_id_leak() {
+  run_case leak_client
+  check "leak_client: exit 1" "$([ "${RC}" -eq 1 ] && echo 0 || echo 1)"
+  check "leak_client: FAIL on 1b, 2a, 3a, 4" "$(has 'FAIL: 1b X=301' && has 'FAIL: 2a deployment' && has 'FAIL: 3a license' && has 'FAIL: 4 combined' && echo 0 || echo 1)"
+  check "leak_client: violation shows client_id=acme" "$(yes 'violation: .*client_id=acme')"
+}
+
 test_inconclusive_baseline() {
   run_case no_later
   check "no_later: exit 0" "$((RC != 0))"
@@ -131,6 +151,10 @@ test_config_guards() {
   check "results: 0 refused" "$([ "${RC}" -eq 2 ] && echo 0 || echo 1)"
   run_case happy --stack-version 3
   check "stack-version: '3' refused" "$([ "${RC}" -eq 2 ] && echo 0 || echo 1)"
+  run_case happy --stack-version 3.100
+  check "stack-version: minor 100 refused (exit 2)" "$([ "${RC}" -eq 2 ] && has 'minor must be <= 99' && echo 0 || echo 1)"
+  run_case happy --stack-version 3.099
+  check "stack-version: minor 099 accepted (leading zeros)" "$([ "${RC}" -eq 0 ] && echo 0 || echo 1)"
   run_case happy --bogus
   check "unknown option refused" "$([ "${RC}" -eq 2 ] && echo 0 || echo 1)"
 }
@@ -174,6 +198,9 @@ test_happy_path
 test_filter_shape
 test_violation
 test_numeric_rejected
+test_numeric_other_error
+test_numeric_empty
+test_client_id_leak
 test_inconclusive_baseline
 test_retrieve_failure
 test_overrides_and_preflight

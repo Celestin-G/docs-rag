@@ -52,6 +52,7 @@ CLI_REGION=""
 ERR_FILE=""
 RESULTS_JSON="[]"
 RETRIEVE_ERR=""
+NUMERIC_EMPTY_LABELS=()
 
 # ---------- logging ----------
 log() { printf '%s\n' "$*"; }
@@ -119,6 +120,12 @@ check_config() {
   fi
   if ! [[ "${STACK_VERSION}" =~ ^[0-9]+\.[0-9]+$ ]]; then
     die_config "--stack-version must look like 3.1, got '${STACK_VERSION}'"
+  fi
+  # scale is major*100+minor: a minor above 99 would collide with the next major
+  local minor="${STACK_VERSION#*.}"
+  minor="${minor#"${minor%%[!0]*}"}"
+  if [ "${#minor}" -gt 2 ]; then
+    die_config "--stack-version minor must be <= 99 (scale is major*100+minor), got '${STACK_VERSION}'"
   fi
   command -v jq >/dev/null 2>&1 || die_config "jq is required"
   command -v aws >/dev/null 2>&1 || die_config "aws CLI v2 is required"
@@ -222,27 +229,35 @@ run_case() {
 
 # ---------- tests ----------
 test_numeric() {
-  local x="$1" label="$2" conds expr
+  local x="$1" label="$2" defer_empty="${3:-0}" conds expr
   conds="$(jq -nc --argjson x "${x}" '[{lessThanOrEquals: {key: "version_min", value: $x}}, {greaterThan: {key: "version_below", value: $x}}]')"
-  expr='(.m.version_min == null) or (.m.version_min > $x) or (.m.version_below == null) or (.m.version_below <= $x)'
+  expr='(.m.client_id != "none") or (.m.version_min == null) or (.m.version_min > $x) or (.m.version_below == null) or (.m.version_below <= $x)'
   log ""
   log "--- ${label}: andAll [client_id, version_min <= ${x}, version_below > ${x}]"
   log "    query: ${BASELINE_QUERY}"
   log "    filter: $(build_filter "${conds}")"
   if ! retrieve "${BASELINE_QUERY}" "${conds}"; then
-    log "=============================================================================="
-    log "NUMERIC FILTERS NOT SUPPORTED: use the fallback in docs/kb-contract-changes.md"
-    log "=============================================================================="
-    log "    error: ${RETRIEVE_ERR}"
-    fail "${label}: numeric filter rejected by the API"
+    if grep -Eqi 'ValidationException|filter|operator' <<<"${RETRIEVE_ERR}"; then
+      log "=============================================================================="
+      log "NUMERIC FILTERS NOT SUPPORTED: use the fallback in docs/kb-contract-changes.md"
+      log "=============================================================================="
+      log "    error: ${RETRIEVE_ERR}"
+      fail "${label}: numeric filter rejected by the API"
+    else
+      fail "${label}: retrieve failed: ${RETRIEVE_ERR}"
+    fi
     return 0
   fi
   print_results
+  if [ "${defer_empty}" -eq 1 ] && [ "$(jq 'length' <<<"${RESULTS_JSON}")" -eq 0 ]; then
+    NUMERIC_EMPTY_LABELS+=("${label}")
+    return 0
+  fi
   report_violations "${label}" "${expr}" "${x}"
 }
 
 test_1_numeric() {
-  local x x2 later total
+  local x x2 later total matching defer=0 l
   x="$(stack_scale "${STACK_VERSION}")"
   x2=$((x + 1))
   log ""
@@ -254,6 +269,8 @@ test_1_numeric() {
     print_results
     total="$(jq 'length' <<<"${RESULTS_JSON}")"
     later="$(jq --argjson x "${x}" '[.[] | select(.m.version_min != null and .m.version_min > $x)] | length' <<<"${RESULTS_JSON}")"
+    matching="$(jq --argjson x "${x}" --argjson x2 "$((x + 1))" '[.[] | select(.m.version_min != null and .m.version_below != null and ((.m.version_min <= $x and $x < .m.version_below) or (.m.version_min <= $x2 and $x2 < .m.version_below)))] | length' <<<"${RESULTS_JSON}")"
+    [ "${matching}" -gt 0 ] && defer=1
     if [ "${later}" -gt 0 ]; then
       info "1a baseline: ${later} of ${total} results have version_min > ${x} (content for later versions exists, so the numeric filter has something to exclude)"
     else
@@ -262,8 +279,16 @@ test_1_numeric() {
   else
     fail "1a baseline: retrieve call failed: ${RETRIEVE_ERR}"
   fi
-  test_numeric "${x}" "1b X=${x}"
-  test_numeric "${x2}" "1c X=${x2}"
+  NUMERIC_EMPTY_LABELS=()
+  test_numeric "${x}" "1b X=${x}" "${defer}"
+  test_numeric "${x2}" "1c X=${x2}" "${defer}"
+  if [ "${#NUMERIC_EMPTY_LABELS[@]}" -eq 2 ]; then
+    fail "1b/1c: numeric filter matched nothing although matching content exists; numbers may be stored as strings"
+  else
+    for l in ${NUMERIC_EMPTY_LABELS[@]+"${NUMERIC_EMPTY_LABELS[@]}"}; do
+      info "${l}: 0 results, nothing to check (inconclusive)"
+    done
+  fi
 }
 
 test_2_deployment() {
@@ -273,7 +298,7 @@ test_2_deployment() {
   c1="$(c_in deployment cloud any)"
   c2="$(c_in deployment self-hosted any)"
   run_case "2a deployment in [cloud, any]" "${CLOUD_QUERY}" "[${c1}]" \
-    '(.m.deployment | IN("cloud", "any") | not)'
+    '(.m.client_id != "none") or (.m.deployment | IN("cloud", "any") | not)'
   cloud="$(jq -c '[.[] | select(.m.deployment == "cloud")]' <<<"${RESULTS_JSON}")"
   if [ "$(jq 'length' <<<"${cloud}")" -gt 0 ]; then
     info "2a: $(jq 'length' <<<"${cloud}") results with deployment=cloud (expected > 0): $(jq -r '[.[].url] | join(", ")' <<<"${cloud}")"
@@ -281,7 +306,7 @@ test_2_deployment() {
     info "2a: 0 results with deployment=cloud (expected > 0): check that cloud-only content is published and the query matches it"
   fi
   run_case "2b deployment in [self-hosted, any]" "${CLOUD_QUERY}" "[${c2}]" \
-    '(.m.deployment | IN("self-hosted", "any") | not)'
+    '(.m.client_id != "none") or (.m.deployment | IN("self-hosted", "any") | not)'
 }
 
 test_3_license() {
@@ -291,7 +316,7 @@ test_3_license() {
   c1="$(c_in license ee any)"
   c2="$(c_in license oss any)"
   run_case "3a license in [ee, any]" "${EE_QUERY}" "[${c1}]" \
-    '(.m.license | IN("ee", "any") | not)'
+    '(.m.client_id != "none") or (.m.license | IN("ee", "any") | not)'
   ee="$(jq -c '[.[] | select(.m.license == "ee")]' <<<"${RESULTS_JSON}")"
   if [ "$(jq 'length' <<<"${ee}")" -gt 0 ]; then
     info "3a: $(jq 'length' <<<"${ee}") results with license=ee (expected > 0): $(jq -r '[.[].url] | join(", ")' <<<"${ee}")"
@@ -299,7 +324,7 @@ test_3_license() {
     info "3a: 0 results with license=ee (expected > 0): check that enterprise content is published and the query matches it"
   fi
   run_case "3b license in [oss, any]" "${EE_QUERY}" "[${c2}]" \
-    '(.m.license | IN("oss", "any") | not)'
+    '(.m.client_id != "none") or (.m.license | IN("oss", "any") | not)'
 }
 
 test_4_combined() {

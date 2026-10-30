@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fake `aws` CLI for scripts/kb-verify.sh tests. Never talks to AWS.
 # Env: FAKE_AWS_DIR (state dir, required; every call is logged to calls.log)
-#      FAKE_AWS_SCENARIO: happy | empty | garbage | sparse | leak (ignores the filter) | numeric_reject | no_later | retrieve_fail | kb_missing
+#      FAKE_AWS_SCENARIO: happy | empty | garbage | sparse | leak (ignores the filter) | numeric_reject | numeric_other_error | numeric_empty | leak_client (ignores only client_id) | no_later | retrieve_fail | kb_missing
 set -euo pipefail
 
 state="${FAKE_AWS_DIR:?}"
@@ -45,6 +45,14 @@ retrieve() {
     echo "An error occurred (ValidationException) when calling the Retrieve operation: unsupported filter operator" >&2
     exit 254
   fi
+  if [ "${scenario}" = "numeric_other_error" ] && grep -Eq 'lessThanOrEquals|greaterThan' <<<"${cfg}"; then
+    echo "An error occurred (AccessDeniedException) when calling the Retrieve operation: not authorized" >&2
+    exit 254
+  fi
+  if [ "${scenario}" = "numeric_empty" ] && grep -Eq 'lessThanOrEquals|greaterThan' <<<"${cfg}"; then
+    echo '{"retrievalResults":[]}'
+    return 0
+  fi
   case "${scenario}" in
     empty) echo '{"retrievalResults":[]}'; return 0 ;;
     garbage) echo 'not json <html>'; return 0 ;;
@@ -56,6 +64,7 @@ retrieve() {
     def num: if type == "string" then tonumber else . end;
     def ev($m):
       if has("andAll") then all(.andAll[]; ev($m))
+      elif has("in") and $scenario == "leak_client" and .in.key == "client_id" then true
       elif has("in") then (.in as $e | any($e.value[]; . == $m[$e.key]))
       elif has("lessThanOrEquals") then (.lessThanOrEquals as $e | ($m[$e.key] | num) <= $e.value)
       elif has("greaterThan") then (.greaterThan as $e | ($m[$e.key] | num) > $e.value)
