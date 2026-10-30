@@ -231,6 +231,8 @@ func chunksFromVersions(relPath, dataset, component string, versions []vccVersio
 	type span struct {
 		text        string
 		from, below int16
+		rawMin      string
+		rawBelow    string
 	}
 	spans := map[string][]span{}
 	var ids []string
@@ -246,13 +248,14 @@ func chunksFromVersions(relPath, dataset, component string, versions []vccVersio
 			if n := len(prev); n > 0 && prev[n-1].text == text && prev[n-1].below == from {
 				// Same content, directly adjacent range: extend rather than repeat.
 				prev[n-1].below = below
+				prev[n-1].rawBelow = v.Range.Below
 				spans[id] = prev
 				continue
 			}
 			if len(prev) == 0 {
 				ids = append(ids, id)
 			}
-			spans[id] = append(prev, span{text: text, from: from, below: below})
+			spans[id] = append(prev, span{text: text, from: from, below: below, rawMin: v.Range.Min, rawBelow: v.Range.Below})
 		}
 	}
 
@@ -266,6 +269,8 @@ func chunksFromVersions(relPath, dataset, component string, versions []vccVersio
 				Content:          s.text,
 				VersionNum:       s.from,
 				VersionBelow:     s.below,
+				VersionMinRaw:    s.rawMin,
+				VersionBelowRaw:  s.rawBelow,
 				VersionComponent: component,
 				Deployment:       "both",
 			})

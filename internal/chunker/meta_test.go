@@ -68,3 +68,58 @@ func TestParseMetaDeploymentFromPath(t *testing.T) {
 		}
 	}
 }
+
+// The raw frontmatter strings and heading fields are what the knowledge-base
+// publisher builds its metadata from; the compact int16 fields cannot carry them.
+func TestParseFileKeepsRawMetadata(t *testing.T) {
+	src := `---
+path: /modules/ledger/accounts
+title: "Accounts"
+component: ledger
+version: { min: "2.4.0", below: "3.0.0" }
+---
+
+Intro text.
+
+## Model
+
+Model text.
+
+### Balances ##
+
+Balance text.
+`
+	chunks := ParseFile("apps/docs/content/pages/modules/ledger/accounts.mdx", []byte(src))
+	if len(chunks) != 3 {
+		t.Fatalf("got %d chunks, want 3", len(chunks))
+	}
+	for i, want := range []struct {
+		leaf, breadcrumb, body string
+	}{
+		{"", "Accounts", "Intro text."},
+		{"Model", "Accounts > Model", "Model text."},
+		{"Balances ##", "Accounts > Model > Balances ##", "Balance text."},
+	} {
+		c := chunks[i]
+		if c.Leaf != want.leaf || c.Breadcrumb != want.breadcrumb || c.Body != want.body || c.SectionSeq != i {
+			t.Errorf("chunk %d = {%q %q %q seq %d}, want %+v", i, c.Leaf, c.Breadcrumb, c.Body, c.SectionSeq, want)
+		}
+		if c.Content != c.Breadcrumb+"\n\n"+c.Body {
+			t.Errorf("chunk %d Content %q is not breadcrumb + body", i, c.Content)
+		}
+		if c.PagePath != "/modules/ledger/accounts" || c.Title != "Accounts" ||
+			c.VersionMinRaw != "2.4.0" || c.VersionBelowRaw != "3.0.0" || c.VersionComponent != "ledger" {
+			t.Errorf("chunk %d metadata = %+v", i, c)
+		}
+	}
+}
+
+func TestParseGeneratedJSONKeepsRawRanges(t *testing.T) {
+	src := `{"ledger.events": {"__component": "ledger", "__versions": [
+	  {"range": {"min": "2.3.0", "below": "2.4.0"}, "data": {"A": "same"}},
+	  {"range": {"min": "2.4.0", "below": "3.0.0"}, "data": {"A": "same"}}]}}`
+	chunks := ParseGeneratedJSON("x.json", []byte(src))
+	if len(chunks) != 1 || chunks[0].VersionMinRaw != "2.3.0" || chunks[0].VersionBelowRaw != "3.0.0" {
+		t.Fatalf("got %+v, want one chunk spanning 2.3.0 to 3.0.0", chunks)
+	}
+}

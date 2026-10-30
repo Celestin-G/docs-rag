@@ -1,8 +1,8 @@
-package cmd
+package docsource
 
 import "testing"
 
-// isDocFile decides what reaches the index. Anything it lets through that is
+// IsDocFile decides what reaches the index. Anything it lets through that is
 // not published documentation ends up competing with the real pages in
 // retrieval — and, in the case of the connector template, inventing a stack
 // version that does not exist.
@@ -21,8 +21,22 @@ func TestIsDocFile(t *testing.T) {
 		"README.md":                                               false,
 		"CLAUDE.md":                                               false,
 	} {
-		if got := isDocFile(path); got != want {
-			t.Errorf("isDocFile(%q) = %v, want %v", path, got, want)
+		if got := IsDocFile(path); got != want {
+			t.Errorf("IsDocFile(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
+
+func TestKind(t *testing.T) {
+	for _, tc := range []struct{ rel, want string }{
+		{"apps/docs/content/pages/a.mdx", KindPage},
+		{"apps/docs/content/fragments/a.mdx", KindFragment},
+		{"apps/docs/content/data/generated/a.json", KindGenerated},
+		{"packages/numscript-engine/README.md", KindNumscriptEngine},
+		{"README.md", ""},
+	} {
+		if got := Kind(tc.rel); got != tc.want {
+			t.Errorf("Kind(%q) = %q, want %q", tc.rel, got, tc.want)
 		}
 	}
 }
