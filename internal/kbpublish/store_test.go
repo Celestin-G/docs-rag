@@ -141,6 +141,14 @@ func TestCheckDeletes(t *testing.T) {
 		{"over 20 percent allowed", mk(10, 3), true, ""},
 		{"outside docs is never allowed", &Diff{Existing: 100, Others: []string{"other/x.txt"}}, true, "outside docs/"},
 		{"outside docs via a body", &Diff{Existing: 100, Deleted: []string{"private/a.md"}}, true, "outside docs/"},
+		// The prefix is "docs/" with its slash: a sibling that merely starts with
+		// "docs" is outside it.
+		{"sibling prefix without slash", &Diff{Existing: 100, Deleted: []string{"docsx/a.md"}}, true, "outside docs/"},
+		{"orphan sidecar next to docs", &Diff{Existing: 100, OrphanSidecars: []string{"docs.md" + sidecarSuffix}}, true, "outside docs/"},
+		{"the bare prefix itself", &Diff{Existing: 100, Others: []string{"docs"}}, true, "outside docs/"},
+		// A stale body takes its sidecar with it: both count against the 20%.
+		{"sidecars count at the limit", &Diff{Existing: 10, Deleted: []string{"docs/a.md"}}, false, ""},
+		{"sidecars count over the limit", &Diff{Existing: 9, Deleted: []string{"docs/a.md"}}, false, "refusing to delete 2 of 9"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.d.CheckDeletes(tc.allow)
@@ -148,6 +156,61 @@ func TestCheckDeletes(t *testing.T) {
 				t.Errorf("err = %v, want %q", err, tc.fail)
 			}
 		})
+	}
+}
+
+// prefixSpy records the listing prefix and returns keys a buggy or shared
+// store could hand back regardless of it.
+type prefixSpy struct {
+	*memStore
+	prefixes []string
+}
+
+func (p *prefixSpy) List(_ context.Context, prefix string) ([]Object, error) {
+	p.prefixes = append(p.prefixes, prefix)
+	var out []Object
+	for k := range p.objects {
+		out = append(out, Object{Key: k})
+	}
+	return out, nil
+}
+
+func TestComputeDiffPrefixSafety(t *testing.T) {
+	want := file("docs/a.md", "a")
+	store := &prefixSpy{memStore: newMem(map[string]string{
+		"docs/a.md" + sidecarSuffix:   "x", // body missing: the wanted file is new, its sidecar is not an orphan
+		"docsx/b.md":                  "x",
+		"secret/c.md" + sidecarSuffix: "x",
+	})}
+	d, err := ComputeDiff(t.Context(), store, []File{want}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(store.prefixes, []string{"docs/"}) {
+		t.Errorf("listing prefixes = %q, want exactly [\"docs/\"]", store.prefixes)
+	}
+	if !slices.Equal(d.New, []string{"docs/a.md"}) || slices.Contains(d.DeleteKeys(), "docs/a.md"+sidecarSuffix) {
+		t.Errorf("sidecar without body: new %v, delete %v", d.New, d.DeleteKeys())
+	}
+	// Keys outside docs/ that leak through the listing are refused even with
+	// --allow-mass-delete, and Apply writes nothing.
+	if err := d.CheckDeletes(true); err == nil || !strings.Contains(err.Error(), "outside docs/") {
+		t.Errorf("CheckDeletes = %v, want a refusal", err)
+	}
+	if err := Apply(t.Context(), store, d, []File{want}, true, 1); err == nil || len(store.puts) != 0 || len(store.deletes) != 0 {
+		t.Errorf("Apply = %v, puts %v, deletes %v: must refuse before any write", err, store.puts, store.deletes)
+	}
+}
+
+type failingHash struct{ *memStore }
+
+func (failingHash) Hash(context.Context, string) (string, error) { return "", errors.New("throttled") }
+
+func TestComputeDiffHashErrorIsFatal(t *testing.T) {
+	f := file("docs/a.md", "a")
+	store := failingHash{newMem(map[string]string{"docs/a.md": f.Hash, "docs/a.md" + sidecarSuffix: f.Hash})}
+	if d, err := ComputeDiff(t.Context(), store, []File{f}, 0); err == nil || d != nil {
+		t.Errorf("a failed HeadObject must abort the diff, got %+v, %v", d, err)
 	}
 }
 

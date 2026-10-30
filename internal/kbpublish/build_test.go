@@ -334,3 +334,28 @@ func TestBuildExcludes(t *testing.T) {
 		t.Errorf("excluded file still built: %+v", p.Report)
 	}
 }
+
+// A frontmatter path is author input: dot segments, a leading "docs" and
+// uppercase must not move a key out of docs/<product>/ or break the charset.
+func TestBuildKeysStayUnderDocs(t *testing.T) {
+	page := func(path string) []byte {
+		return []byte("---\npath: " + path + "\ntitle: T\n---\n\n## S\n\ntext\n")
+	}
+	p := Build([]SourceFile{
+		{Rel: "apps/docs/content/pages/a.mdx", Content: page("/../../etc/passwd")},
+		{Rel: "apps/docs/content/pages/b.mdx", Content: page("/./x/../Y Z")},
+		{Rel: "apps/docs/content/pages/c.mdx", Content: page("..")},
+		{Rel: "apps/docs/content/fragments/../../../../x.mdx", Content: []byte("## S\n\ntext\n")},
+	}, Options{Table: mustTable(t), Dates: fakeDates{}})
+	if len(p.Errors) != 0 {
+		t.Fatalf("errors: %v", p.Errors)
+	}
+	if len(p.Files) < 3 {
+		t.Fatalf("got %d files", len(p.Files))
+	}
+	for _, f := range p.Files {
+		if !strings.HasPrefix(f.Key, "docs/other/") || len(ValidateKey(f.Key)) != 0 {
+			t.Errorf("key %q escapes docs/other/ or is invalid: %v", f.Key, ValidateKey(f.Key))
+		}
+	}
+}

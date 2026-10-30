@@ -90,6 +90,10 @@ func TestValidateKey(t *testing.T) {
 		{"docs/ledger/a.txt", false},
 		{"docs/../a.md", false},
 		{"docs//a.md", false},
+		{"docsx/a.md", false},
+		{"docs.md", false},
+		{"docs/./a.md", false},
+		{"/docs/a.md", false},
 		{"docs/" + strings.Repeat("a", 1100) + ".md", false},
 	} {
 		if got := len(ValidateKey(tc.key)) == 0; got != tc.ok {
