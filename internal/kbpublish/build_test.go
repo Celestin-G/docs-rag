@@ -1,6 +1,7 @@
 package kbpublish
 
 import (
+	"encoding/json"
 	"slices"
 	"strings"
 	"testing"
@@ -281,12 +282,18 @@ func TestBuildMapping(t *testing.T) {
 		if strings.Contains(f.Key, "/big") && !strings.HasPrefix(string(f.Body), "Accounts > Big\nApplies to:") {
 			t.Errorf("%s does not repeat the breadcrumb and header: %.60q", f.Key, f.Body)
 		}
-		if len(f.Body) > maxFileBytes+minPartBudget {
+		if len(f.Body) > maxFileBytes {
 			t.Errorf("%s is %d bytes", f.Key, len(f.Body))
 		}
 	}
 
 	side := string(byKey["docs/ledger/modules/ledger/accounts/setup-2.md"].Sidecar)
+	var sc struct {
+		Attrs map[string]any `json:"metadataAttributes"`
+	}
+	if err := json.Unmarshal([]byte(side), &sc); err != nil || len(sc.Attrs) != 11 || sc.Attrs["version"] != nil {
+		t.Errorf("the sidecar must have 11 keys and no legacy version key: %v %s", err, side)
+	}
 	for _, want := range []string{
 		`"source_url":"https://docs.formance.com/modules/ledger/accounts#setup-1"`, // second heading of that name
 		`"license":"ee"`, `"version_min":400`, `"version_below":99999`, `"version_component":"ledger"`,
@@ -389,11 +396,82 @@ func TestDefaultExcludes(t *testing.T) {
 		"apps/docs/content/data/generated/stack.oas.enriched.json":    true,
 		"apps/docs/content/data/generated/stack.oas.prose.json":       true,
 		"apps/docs/content/data/generated/membership.oas.json":        true,
+		"apps/docs/content/data/generated/api.schemas.json":           true,
+		"apps/docs/content/data/generated/ledger.cli-flags.json":      false,
 		"apps/docs/content/data/generated/api.operations.json":        false,
 		"apps/docs/content/data/generated/membership.operations.json": false,
 	} {
 		if got := excluded(rel, DefaultExcludes); got != want {
 			t.Errorf("excluded(%q) = %v, want %v", rel, got, want)
 		}
+	}
+}
+
+// A range no Stack release ships is left out, never widened; a component that
+// leaves the Stack is capped at the first release without it.
+func TestBuildUnshippedAndCapped(t *testing.T) {
+	page := func(path, front, body string) []byte {
+		return []byte("---\npath: " + path + "\ntitle: T\n" + front + "---\n\n" + body)
+	}
+	p := Build([]SourceFile{
+		{Rel: "apps/docs/content/pages/empty.mdx", Content: page("/modules/payments/empty", "component: payments\nversion: { min: \"3.2.0\", below: \"3.3.0\" }\n", "Intro.\n\n## A\n\ntext a\n\n## B\n\ntext b\n")},
+		{Rel: "apps/docs/content/pages/inline.mdx", Content: page("/modules/payments/inline", "", "## S\n\nKept text.\n\n<When component=\"payments\" minimum=\"3.2.0\" below=\"3.3.0\">\n\nDropped text.\n\n</When>\n")},
+		{Rel: "apps/docs/content/pages/capped.mdx", Content: page("/modules/payments/capped", "component: payments\n", "## S\n\ntext\n")},
+	}, Options{Table: mustTable(t), Dates: fakeDates{}})
+	if len(p.Errors) != 0 {
+		t.Fatalf("errors: %v", p.Errors)
+	}
+	r := p.Report
+	if len(r.Widened) != 0 || len(r.Unshipped) != 2 || r.UnshippedChunks != 3 || r.UnshippedBlocks != 1 {
+		t.Errorf("widened %v, unshipped %v, chunks %d, blocks %d", r.Widened, r.Unshipped, r.UnshippedChunks, r.UnshippedBlocks)
+	}
+	if x := r.Unshipped[0]; x.File != "apps/docs/content/pages/empty.mdx" || x.Inline || x.Component != "payments" || x.Bound != "min 3.2.0, below 3.3.0" {
+		t.Errorf("exclusion = %+v", x)
+	}
+	for _, f := range p.Files {
+		body, side := string(f.Body), string(f.Sidecar)
+		switch {
+		case strings.Contains(f.Key, "/empty/"):
+			t.Errorf("an empty range was published: %s", f.Key)
+		case strings.Contains(body, "Dropped text"):
+			t.Errorf("the dropped block survived: %s", body)
+		case strings.Contains(f.Key, "/capped/"):
+			if !strings.Contains(side, `"version_below":400`) || !strings.Contains(body, "Applies to: before Stack v4.0") {
+				t.Errorf("capped page: %s %s", body, side)
+			}
+		}
+	}
+	var out strings.Builder
+	r.PrintSummary(&out, nil)
+	if !strings.Contains(out.String(), "EXCLUDED: no Stack release ships these ranges: 2 entries (1 page-level, 1 inline); 3 chunks and 1 inline blocks") {
+		t.Errorf("summary:\n%s", out.String())
+	}
+}
+
+func TestBuildDatasetExcludes(t *testing.T) {
+	src := []SourceFile{{Rel: "apps/docs/content/data/generated/numscript.snippets.json", Content: []byte(`{"ds.keep": {"A": "a"}, "ds.drop": {"B": "b", "C": "c"}}`)}}
+	for _, tc := range []struct {
+		name     string
+		excludes []string
+		files    int
+		dropped  int
+	}{
+		{"none", nil, 3, 0},
+		{"one dataset", []string{"ds.drop"}, 1, 2},
+		{"glob", []string{"ds.*"}, 0, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := Build(src, Options{Table: mustTable(t), Dates: fakeDates{}, DatasetExcludes: tc.excludes})
+			total := 0
+			for _, n := range p.Report.DatasetExcluded {
+				total += n
+			}
+			if len(p.Files) != tc.files || total != tc.dropped {
+				t.Errorf("files %d (want %d), dataset chunks dropped %d (want %d)", len(p.Files), tc.files, total, tc.dropped)
+			}
+		})
+	}
+	if !excluded("cookbook.numscript.byFingerprint", DefaultDatasetExcludes) || excluded("cookbook.numscript.snippets", DefaultDatasetExcludes) {
+		t.Errorf("default dataset excludes = %v", DefaultDatasetExcludes)
 	}
 }

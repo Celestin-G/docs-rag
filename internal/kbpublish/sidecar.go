@@ -24,7 +24,7 @@ var allowedProducts = []string{"ledger", "payments", "wallets", "flows", "reconc
 
 // attrKeys are all the attribute names a docs sidecar may carry.
 var attrKeys = []string{
-	"doc_type", "product", "version", "version_min", "version_below", "version_component",
+	"doc_type", "product", "version_min", "version_below", "version_component",
 	"deployment", "license", "client_id", "language", "source_url", "updated_at",
 }
 
@@ -130,7 +130,6 @@ func (a Attrs) Validate() []string {
 
 	oneOf("doc_type", "doc")
 	oneOf("product", allowedProducts...)
-	oneOf("version", "any")
 	oneOf("deployment", "cloud", "self-hosted", "any")
 	oneOf("license", "ee", "oss", "any")
 	oneOf("client_id", "none")

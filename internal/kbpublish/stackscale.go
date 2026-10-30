@@ -338,6 +338,31 @@ func (t *StackTable) Upper(component, version string) (int, bool) {
 	return NoUpperBound, true
 }
 
+// leaveCap is the Stack-scale number of the first release that no longer lists
+// the component after a release that did (payments, wallets, flows, reconciliation
+// and webhooks are absent from v4.0): content about it cannot apply from there.
+// numscript-interpreter is bundled in Ledger and follows Ledger's cap, never one
+// of its own. ok is false when the component never leaves the table.
+func (t *StackTable) leaveCap(component string) (int, bool) {
+	component = canonical(component)
+	switch component {
+	case "stack":
+		return 0, false
+	case "numscript-interpreter":
+		component = "ledger"
+	}
+	listed := false
+	for _, r := range t.stack {
+		if _, ok := r.requires[component]; ok {
+			listed = true
+		} else if listed {
+			scale, ok := stackScale(r.version)
+			return scale, ok
+		}
+	}
+	return 0, false
+}
+
 // knows reports whether any Stack release lists the component.
 func (t *StackTable) knows(component string) bool {
 	for _, r := range t.stack {

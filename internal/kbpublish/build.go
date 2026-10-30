@@ -12,22 +12,31 @@ import (
 	"github.com/celestingeniaut/docs-rag/internal/docsource"
 )
 
-// maxFileBytes is the size above which a knowledge-base file is split again. The
-// Bedrock chunker is semantic with a 512-token ceiling, and a file near it gets
-// cut mid-thought; 1800 bytes keeps one idea per file.
-const maxFileBytes = 1800
+// maxFileBytes is the budget of one knowledge-base file as uploaded: breadcrumb,
+// "Applies to:" header and body together. A longer chunk is split again, the
+// breadcrumb and header repeated in each piece. The Bedrock chunker is semantic
+// with a 512-token ceiling; about 1500 bytes keeps a file under it in most cases
+// (not guaranteed: a long breadcrumb or unbreakable line can exceed it).
+const maxFileBytes = 1500
 
 // minPartBudget keeps a very long breadcrumb from squeezing the body to nothing.
 const minPartBudget = 400
 
 // DefaultExcludes are left out unless --no-default-excludes is passed: the raw
-// OpenAPI dumps. The same API is published in readable form (the api.operations,
-// api.schemas and membership.operations datasets).
+// OpenAPI dumps and the JSON-schema dump. The API is published in readable form
+// by the api.operations and membership.operations files.
 var DefaultExcludes = []string{
 	"apps/docs/content/data/generated/stack.oas.json",
 	"apps/docs/content/data/generated/stack.oas.enriched.json",
 	"apps/docs/content/data/generated/stack.oas.prose.json",
 	"apps/docs/content/data/generated/membership.oas.json",
+	"apps/docs/content/data/generated/api.schemas.json",
+}
+
+// DefaultDatasetExcludes are datasets left out of generated files by default: the
+// by-fingerprint index duplicates the snippets of the same numscript.snippets.json.
+var DefaultDatasetExcludes = []string{
+	"cookbook.numscript.byFingerprint",
 }
 
 // SourceFile is one documentation file read from the docs checkout.
@@ -41,6 +50,9 @@ type Options struct {
 	Table    *StackTable
 	Dates    DateSource
 	Excludes []string // globs on repo-relative paths
+	// DatasetExcludes are globs on dataset names inside generated files (the
+	// "dataset" of "dataset › entry"): those chunks are left out.
+	DatasetExcludes []string
 }
 
 // DatasetStat counts the knowledge-base files of one generated dataset.
@@ -51,8 +63,10 @@ type DatasetStat struct {
 
 // Report is what Build observed, for the dry-run output.
 type Report struct {
-	FilesByKind     map[string]int
-	Excluded        int
+	FilesByKind map[string]int
+	Excluded    int
+	// DatasetExcluded counts the chunks left out per excluded dataset.
+	DatasetExcluded map[string]int
 	Chunks          int
 	KBFiles         int
 	ResplitChunks   int // chunks that became more than one file
@@ -63,6 +77,11 @@ type Report struct {
 	WhenNotes       int
 	DocCaseNotes    int
 	Widened         []Widening
+	// Excluded*: ranges no Stack release ships. Entries are deduplicated by file
+	// and bound; the counts are chunks (page-level) and blocks (inline).
+	Unshipped       []Exclusion
+	UnshippedChunks int
+	UnshippedBlocks int
 	URLFallbacks    []string
 	AnchorMisses    []string
 	Unhandled       []string
@@ -88,9 +107,10 @@ func Build(sources []SourceFile, opts Options) *Plan {
 	refs := buildRefs(sources)
 
 	p := &Plan{Report: Report{
-		FilesByKind: map[string]int{},
-		ByProduct:   map[string]int{},
-		ByDataset:   map[string]DatasetStat{},
+		FilesByKind:     map[string]int{},
+		ByProduct:       map[string]int{},
+		ByDataset:       map[string]DatasetStat{},
+		DatasetExcluded: map[string]int{},
 	}}
 	rep := &p.Report
 	owner := map[string]string{} // key -> source file
@@ -118,6 +138,10 @@ func Build(sources []SourceFile, opts Options) *Plan {
 		for _, w := range inl.Widened {
 			addWidening(rep, seenWiden, w)
 		}
+		for _, x := range inl.Excluded {
+			addExclusion(rep, seenWiden, x)
+		}
+		rep.UnshippedBlocks += inl.Dropped
 		if len(chunks) == 0 {
 			rep.Empty = append(rep.Empty, src.Rel)
 			continue
@@ -161,16 +185,21 @@ func Build(sources []SourceFile, opts Options) *Plan {
 		}
 	}
 
-	sort.Slice(rep.Widened, func(i, j int) bool {
-		a, b := rep.Widened[i], rep.Widened[j]
-		if a.File != b.File {
-			return a.File < b.File
-		}
-		if a.Inline != b.Inline {
-			return !a.Inline
-		}
-		return a.Bound < b.Bound
-	})
+	for _, list := range [][]Widening{rep.Widened, rep.Unshipped} {
+		sort.Slice(list, func(i, j int) bool {
+			a, b := list[i], list[j]
+			if a.File != b.File {
+				return a.File < b.File
+			}
+			if a.Inline != b.Inline {
+				return !a.Inline
+			}
+			if a.Component != b.Component {
+				return a.Component < b.Component
+			}
+			return a.Bound < b.Bound
+		})
+	}
 	rep.URLFallbacks = collapse(rep.URLFallbacks)
 	rep.AnchorMisses = collapse(rep.AnchorMisses)
 	sort.Strings(rep.Unhandled)
@@ -197,12 +226,21 @@ func collapse(lines []string) []string {
 }
 
 func addWidening(rep *Report, seen map[string]bool, w Widening) {
-	id := fmt.Sprintf("%s|%v|%s|%s", w.File, w.Inline, w.Component, w.Bound)
+	id := fmt.Sprintf("w|%s|%v|%s|%s", w.File, w.Inline, w.Component, w.Bound)
 	if seen[id] {
 		return
 	}
 	seen[id] = true
 	rep.Widened = append(rep.Widened, w)
+}
+
+func addExclusion(rep *Report, seen map[string]bool, x Exclusion) {
+	id := fmt.Sprintf("x|%s|%v|%s|%s", x.File, x.Inline, x.Component, x.Bound)
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	rep.Unshipped = append(rep.Unshipped, x)
 }
 
 // parseSource chunks one file; a panic in the parser becomes an error.
@@ -250,12 +288,25 @@ type fileContext struct {
 func (fc *fileContext) files(c chunker.Chunk, p *Plan, seenWiden map[string]bool) []builtFile {
 	rel := fc.src.Rel
 	conv := fc.opts.Table.Convert(c.VersionComponent, c.VersionMinRaw, c.VersionBelowRaw)
+
+	product, base, dataset, entry := fc.place(c)
+	if fc.kind == docsource.KindGenerated && excluded(dataset, fc.opts.DatasetExcludes) {
+		fc.rep.DatasetExcluded[dataset]++
+		return nil
+	}
+	url := fc.sourceURL(c, dataset, entry)
+	// The key counter and anchor scan advance for every chunk, excluded or not, so
+	// excluding one never renumbers the -2/-3 keys or anchors of the next.
+	n := fc.counts[base]
+	fc.counts[base]++
+	if conv.Empty {
+		addExclusion(fc.rep, seenWiden, widening(rel, false, conv))
+		fc.rep.UnshippedChunks++
+		return nil
+	}
 	if conv.Widened() {
 		addWidening(fc.rep, seenWiden, widening(rel, false, conv))
 	}
-
-	product, base, dataset, entry := fc.place(c)
-	url := fc.sourceURL(c, dataset, entry)
 	updated, _ := fc.opts.Dates.Date(rel)
 
 	license := "any"
@@ -272,7 +323,6 @@ func (fc *fileContext) files(c chunker.Chunk, p *Plan, seenWiden map[string]bool
 	attrs := Attrs{
 		"doc_type":          "doc",
 		"product":           product,
-		"version":           "any",
 		"version_min":       conv.Min,
 		"version_below":     conv.Below,
 		"version_component": versionComponent(c.VersionComponent),
@@ -320,8 +370,6 @@ func (fc *fileContext) files(c chunker.Chunk, p *Plan, seenWiden map[string]bool
 	}
 
 	// The same base key twice on a page gets -2, -3 in document order.
-	n := fc.counts[base]
-	fc.counts[base]++
 	if n > 0 {
 		base = fmt.Sprintf("%s-%d", base, n+1)
 	}

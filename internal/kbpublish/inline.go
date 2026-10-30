@@ -20,14 +20,22 @@ type Widening struct {
 	Inline    bool // false: the page's frontmatter; true: an inline block
 	Component string
 	Bound     string // the original bound, e.g. "min 3.3.0, below 3.4.0"
-	Reason    string // "not convertible" or "empty range after conversion"
 }
+
+// Exclusion records a chunk or inline block left out because no Stack release
+// ships its range. The fields mirror Widening.
+type Exclusion = Widening
 
 // InlineReport is what RewriteInline did to one file.
 type InlineReport struct {
 	WhenNotes    int
 	DocCaseNotes int
 	Widened      []Widening
+	// Excluded lists the inline blocks dropped, with their text, because their
+	// range is empty after conversion; Dropped counts every one (Excluded is
+	// deduplicated).
+	Excluded []Exclusion
+	Dropped  int
 	// Unhandled lists <When> or <DocCase> occurrences the rewriter did not
 	// understand (an opening tag followed by text on the same line, say). They are
 	// left to the chunker, which strips the tag, and reported so none is silent.
@@ -82,6 +90,7 @@ func audienceFrom(vis map[string][]string) Audience {
 	}
 }
 
+// widening describes the original bounds of a conversion.
 func widening(file string, inline bool, c Conversion) Widening {
 	var parts []string
 	if c.MinRaw != "" {
@@ -90,11 +99,7 @@ func widening(file string, inline bool, c Conversion) Widening {
 	if c.BelowRaw != "" {
 		parts = append(parts, "below "+c.BelowRaw)
 	}
-	reason := "not convertible"
-	if c.Empty {
-		reason = "empty range after conversion"
-	}
-	return Widening{File: file, Inline: inline, Component: c.Component, Bound: strings.Join(parts, ", "), Reason: reason}
+	return Widening{File: file, Inline: inline, Component: c.Component, Bound: strings.Join(parts, ", ")}
 }
 
 // RewriteInline replaces each <When> opening tag with an "(Applies …)" note
@@ -191,6 +196,21 @@ func RewriteInline(rel string, raw []byte, t *StackTable) ([]byte, InlineReport)
 			aud = audienceFrom(visibilityValues(m[1]))
 		}
 		conv := t.Convert(comp, get(minimumAtt), get(belowAtt))
+		if conv.Empty {
+			// No Stack release ships this range: the block is dropped, text and
+			// all, rather than shown to everyone.
+			if end := blockEnd(lines, i, "</When>"); end >= 0 {
+				if blockHasText(lines, i, "</When>") {
+					rep.Excluded = append(rep.Excluded, widening(rel, true, conv))
+					rep.Dropped++
+				}
+				i = end
+				continue
+			}
+			rep.Unhandled = append(rep.Unhandled, fmt.Sprintf("%s:%d: empty range but no closing tag: %s", rel, start+1, truncate(trimmed, 60)))
+			out = append(out, lines[start:i+1]...)
+			continue
+		}
 		note := InlineNote(conv, aud)
 		// A block that produces no text (only components the chunker strips) gets
 		// no note: it would dangle in front of the next paragraph.
@@ -214,12 +234,9 @@ var (
 	jsxOpenRe     = regexp.MustCompile(`^<[A-Z][A-Za-z.]*`)
 )
 
-// blockHasText reports whether the block opened on lines[open], up to its
-// closing tag, keeps any text once the chunker has stripped the JSX components
-// (it mirrors chunker.stripMDX). A block with no closing tag is assumed to have
-// text, so a note is never dropped on a guess.
-func blockHasText(lines []string, open int, closeTag string) bool {
-	end := -1
+// blockEnd returns the line of the closing tag of the block opened on
+// lines[open], -1 when there is none. Nested <When> blocks are matched.
+func blockEnd(lines []string, open int, closeTag string) int {
 	depth := 1
 	for j := open + 1; j < len(lines); j++ {
 		t := strings.TrimSpace(lines[j])
@@ -228,11 +245,19 @@ func blockHasText(lines []string, open int, closeTag string) bool {
 		}
 		if strings.HasPrefix(t, closeTag) {
 			if depth--; depth == 0 {
-				end = j
-				break
+				return j
 			}
 		}
 	}
+	return -1
+}
+
+// blockHasText reports whether the block opened on lines[open], up to its
+// closing tag, keeps any text once the chunker has stripped the JSX components
+// (it mirrors chunker.stripMDX). A block with no closing tag is assumed to have
+// text, so a note is never dropped on a guess.
+func blockHasText(lines []string, open int, closeTag string) bool {
+	end := blockEnd(lines, open, closeTag)
 	if end < 0 {
 		return true
 	}

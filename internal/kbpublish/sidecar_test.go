@@ -7,7 +7,7 @@ import (
 
 func validAttrs() Attrs {
 	return Attrs{
-		"doc_type": "doc", "product": "ledger", "version": "any", "version_min": 301, "version_below": 99999,
+		"doc_type": "doc", "product": "ledger", "version_min": 301, "version_below": 99999,
 		"version_component": "ledger", "deployment": "any", "license": "ee", "client_id": "none", "language": "en",
 		"source_url": "https://docs.formance.com/modules/ledger/accounts#balances", "updated_at": "2026-10-30",
 	}
@@ -31,7 +31,7 @@ func TestAttrsValidate(t *testing.T) {
 		{"bad license", func(a Attrs) { a["license"] = "paid" }, `"license"`},
 		{"client_id must be none", func(a Attrs) { a["client_id"] = "acme" }, `"client_id"`},
 		{"language", func(a Attrs) { a["language"] = "fr" }, `"language"`},
-		{"version must be any", func(a Attrs) { a["version"] = "3.1" }, `"version"`},
+		{"legacy version key is dropped", func(a Attrs) { a["version"] = "any" }, `unknown attribute "version"`},
 		{"version_min as string", func(a Attrs) { a["version_min"] = "301" }, "must be an integer"},
 		{"version_min fractional", func(a Attrs) { a["version_min"] = 3.5 }, "must be an integer"},
 		{"min not below", func(a Attrs) { a["version_min"] = 400; a["version_below"] = 400 }, "not below"},

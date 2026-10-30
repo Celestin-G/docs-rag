@@ -16,8 +16,11 @@ type Conversion struct {
 	// the ones it may apply to. WidenedMin/WidenedBelow record which.
 	WidenedMin, WidenedBelow bool
 	// Empty marks a range that collapsed (min >= below) once converted: no Stack
-	// release ships it. Both bounds are widened in that case.
+	// release ships it. The chunk or inline block is excluded, never widened.
 	Empty bool
+	// Capped marks an upper bound set by the component leaving the Stack (absent
+	// from a later release), either because the docs gave none or a later one.
+	Capped bool
 	// MinTrivial marks a lower bound at or below the first Stack release: it
 	// restricts nothing, so no phrase names it. Min keeps its value.
 	MinTrivial bool
@@ -49,10 +52,13 @@ func (t *StackTable) Convert(component, minRaw, belowRaw string) Conversion {
 	if c.Min > 0 && !c.WidenedMin && c.Min <= t.firstStack() {
 		c.MinTrivial = true
 	}
+	if !c.WidenedBelow {
+		if limit, ok := t.leaveCap(component); ok && c.Below > limit {
+			c.Below, c.Capped = limit, true
+		}
+	}
 	if !c.Widened() && c.Min >= c.Below {
 		c.Empty = true
-		c.Min, c.Below = 0, NoUpperBound
-		c.WidenedMin, c.WidenedBelow = c.MinRaw != "", c.BelowRaw != ""
 	}
 	return c
 }
@@ -76,7 +82,7 @@ func (c Conversion) fromPhrase() string {
 
 func (c Conversion) beforePhrase() string {
 	switch {
-	case c.BelowRaw == "":
+	case c.BelowRaw == "" && !c.Capped:
 		return ""
 	case c.WidenedBelow:
 		return c.Component + " " + c.BelowRaw
@@ -131,16 +137,15 @@ func (c Conversion) headerPhrase() string {
 	// Name the original bound when the page is scoped to another component, so
 	// the reader sees both scales. Only the bounds the phrase shows are named.
 	if c.Component != "stack" && !c.Widened() {
-		var orig string
+		hasLo, hasHi := from != "", c.BelowRaw != "" && before != ""
 		switch {
-		case from != "" && before != "":
-			orig = c.MinRaw + " up to before " + c.BelowRaw
-		case from != "":
-			orig = c.MinRaw + " and later"
-		default:
-			orig = "before " + c.BelowRaw
+		case hasLo && hasHi:
+			s += " (" + c.Component + " " + c.MinRaw + " up to before " + c.BelowRaw + ")"
+		case hasLo:
+			s += " (" + c.Component + " " + c.MinRaw + " and later)"
+		case hasHi:
+			s += " (" + c.Component + " before " + c.BelowRaw + ")"
 		}
-		s += " (" + c.Component + " " + orig + ")"
 	}
 	return s
 }

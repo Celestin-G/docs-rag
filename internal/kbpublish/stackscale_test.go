@@ -19,15 +19,18 @@ export const formanceSchema: Schema = {
       { version: "v3.1", requires: {
         ledger: { min: "2.3.0", below: "2.4.0" },
         payments: "3.0.18",
+        fctl: { min: "fctl-2.1" },
       }},
       // v3.2 includes the component versions prepared for the cancelled v3.3.
       { version: "v3.2", requires: {
         ledger: { min: "2.4.11", below: "2.5.0" },
         payments: "3.4.0", // a "quoted" // comment
         orchestration: "2.6.0",
+        fctl: { min: "fctl-2.2" },
       }},
       { version: "v4.0", requires: {
         ledger: "3.0.0",
+        fctl: { min: "fctl-2.2" },
       }},
     ]},
     { id: "ledger", name: "Ledger",
@@ -89,7 +92,7 @@ func TestConvert(t *testing.T) {
 		component, minRaw, below string
 		min, bel                 int
 		widenedMin, widenedBelow bool
-		empty                    bool
+		empty, capped            bool
 	}{
 		{name: "no bounds", component: "ledger", bel: NoUpperBound},
 		{name: "stack direct", component: "stack", minRaw: "v3.2", min: 302, bel: NoUpperBound},
@@ -99,11 +102,15 @@ func TestConvert(t *testing.T) {
 		{name: "ledger 3 only in v4", component: "ledger", minRaw: "3.0.0", min: 400, bel: NoUpperBound},
 		{name: "ledger upper bound", component: "ledger", below: "3.0.0", bel: 400},
 		{name: "ledger upper bound never reached", component: "ledger", below: "9.0.0", bel: NoUpperBound},
-		{name: "payments point version", component: "payments", minRaw: "3.0.18", min: 301, bel: NoUpperBound},
-		{name: "payments above every release", component: "payments", minRaw: "3.5.0", bel: NoUpperBound, widenedMin: true},
+		{name: "payments point version", component: "payments", minRaw: "3.0.18", min: 301, bel: 400, capped: true},
+		{name: "payments above every release", component: "payments", minRaw: "3.5.0", bel: 400, widenedMin: true, capped: true},
 		{name: "payments upper bound", component: "payments", below: "3.1.0", bel: 302},
-		{name: "empty range collapses", component: "payments", minRaw: "3.2.0", below: "3.3.0", bel: NoUpperBound, widenedMin: true, widenedBelow: true, empty: true},
-		{name: "flows alias", component: "flows", minRaw: "2.6.0", min: 302, bel: NoUpperBound},
+		{name: "empty range is not widened", component: "payments", minRaw: "3.2.0", below: "3.3.0", min: 302, bel: 302, empty: true},
+		{name: "payments leaves the Stack at v4.0", component: "payments", bel: 400, capped: true},
+		{name: "upper bound beyond every release is capped", component: "payments", below: "9.0.0", bel: 400, capped: true},
+		{name: "upper bound below the cap is kept", component: "payments", below: "3.0.18", bel: 301},
+		{name: "lower bound at the cap is empty", component: "orchestration", minRaw: "2.6.0", below: "2.6.0", min: 302, bel: 302, empty: true},
+		{name: "flows alias", component: "flows", minRaw: "2.6.0", min: 302, bel: 400, capped: true},
 		{name: "cascade lower", component: "numscript-interpreter", minRaw: "0.0.15", min: 301, bel: NoUpperBound},
 		{name: "cascade first interpreter", component: "numscript-interpreter", minRaw: "0.0.10", min: 300, bel: NoUpperBound},
 		{name: "cascade upper", component: "numscript-interpreter", below: "0.0.20", bel: 302},
@@ -114,12 +121,33 @@ func TestConvert(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := tab.Convert(tc.component, tc.minRaw, tc.below)
-			if c.Min != tc.min || c.Below != tc.bel || c.WidenedMin != tc.widenedMin || c.WidenedBelow != tc.widenedBelow || c.Empty != tc.empty {
-				t.Errorf("Convert(%s, %q, %q) = {min %d below %d wmin %v wbelow %v empty %v}, want {%d %d %v %v %v}",
-					tc.component, tc.minRaw, tc.below, c.Min, c.Below, c.WidenedMin, c.WidenedBelow, c.Empty,
-					tc.min, tc.bel, tc.widenedMin, tc.widenedBelow, tc.empty)
+			if c.Min != tc.min || c.Below != tc.bel || c.WidenedMin != tc.widenedMin || c.WidenedBelow != tc.widenedBelow || c.Empty != tc.empty || c.Capped != tc.capped {
+				t.Errorf("Convert(%s, %q, %q) = %+v, want min %d below %d widened %v/%v empty %v capped %v",
+					tc.component, tc.minRaw, tc.below, c, tc.min, tc.bel, tc.widenedMin, tc.widenedBelow, tc.empty, tc.capped)
 			}
 		})
+	}
+}
+
+// A component listed, then absent, then listed again: the cap is the first
+// release without it, and a lower bound shipped only after that is empty.
+func TestConvertLowerBoundAfterCap(t *testing.T) {
+	tab, err := ParseSchema(`{ id: "stack", releases: [
+	  { version: "v3.0", requires: { ledger: "2.0.0", x: "1.0.0" } },
+	  { version: "v3.1", requires: { ledger: "2.0.0" } },
+	  { version: "v3.2", requires: { ledger: "2.0.0", x: "2.0.0" } },
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := tab.Convert("x", "2.0.0", ""); !c.Empty || c.Min != 302 || c.Below != 301 {
+		t.Errorf("lower bound after the cap = %+v, want empty [302, 301)", c)
+	}
+	if c := tab.Convert("x", "1.0.0", ""); c.Empty || c.Min != 300 || c.Below != 301 {
+		t.Errorf("lower bound before the cap = %+v, want [300, 301)", c)
+	}
+	if c := tab.Convert("numscript-interpreter", "", ""); c.Capped {
+		t.Errorf("the interpreter follows ledger, which never leaves: %+v", c)
 	}
 }
 
@@ -138,6 +166,8 @@ func TestNotes(t *testing.T) {
 		{"widened keeps component", "membership", "v2.0.0", "", Audience{}, "(Applies from membership v2.0.0)", "Applies to: membership v2.0.0 and later"},
 		{"audience", "stack", "", "", Audience{License: "ee", Deployment: "self-hosted", Experiment: true}, "(Applies to Enterprise Edition, self-hosted)", "Applies to: Enterprise Edition; self-hosted; experimental feature"},
 		{"version and audience", "stack", "v3.1", "", Audience{Numscript: "new"}, "(Applies from Stack v3.1, to new Numscript interpreter)", "Applies to: Stack v3.1 and later; new Numscript interpreter"},
+		{"component leaving the Stack is capped", "payments", "", "", Audience{}, "(Applies before Stack v4.0)", "Applies to: before Stack v4.0"},
+		{"component lower bound and cap", "payments", "3.0.18", "", Audience{}, "(Applies from Stack v3.1, before v4.0)", "Applies to: Stack v3.1 up to before v4.0 (payments 3.0.18 and later)"},
 		{"nothing", "stack", "", "", Audience{}, "", ""},
 		{"lower bound at the first release restricts nothing", "stack", "v3.0", "", Audience{}, "", ""},
 		{"first-release bound kept out of a range", "stack", "v3.0", "v3.2", Audience{}, "(Applies before Stack v3.2)", "Applies to: before Stack v3.2"},

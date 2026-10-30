@@ -13,6 +13,7 @@ func TestRewriteInline(t *testing.T) {
 		notWant   []string
 		when, dc  int
 		widened   int
+		dropped   int
 		unhandled int
 	}{
 		{
@@ -40,6 +41,16 @@ func TestRewriteInline(t *testing.T) {
 			name: "unconvertible bound keeps component note and is widened",
 			in:   "<When component=\"membership\" minimum=\"v2.0.0\">\nx\n</When>",
 			want: []string{"(Applies from membership v2.0.0)"}, when: 1, widened: 1,
+		},
+		{
+			name: "empty range drops the block with its text",
+			in:   "Before.\n\n<When component=\"payments\" minimum=\"3.2.0\" below=\"3.3.0\">\n\nGone text.\n\n<When component=\"stack\" minimum=\"v3.0\">\nnested\n</When>\n\n</When>\n\nAfter.",
+			want: []string{"Before.", "After."}, notWant: []string{"Gone text", "nested", "Applies", "</When>"}, dropped: 1,
+		},
+		{
+			name: "empty range without a closing tag is kept and reported",
+			in:   "<When component=\"payments\" minimum=\"3.2.0\" below=\"3.3.0\">\nx",
+			want: []string{"x"}, unhandled: 1,
 		},
 		{
 			name: "multi-line opening tag", in: "<When\n  component=\"stack\"\n  below=\"v4.0\">\nx\n</When>",
@@ -84,8 +95,8 @@ func TestRewriteInline(t *testing.T) {
 					t.Errorf("output contains %q:\n%s", w, text)
 				}
 			}
-			if rep.WhenNotes != tc.when || rep.DocCaseNotes != tc.dc || len(rep.Widened) != tc.widened || len(rep.Unhandled) != tc.unhandled {
-				t.Errorf("report = %+v, want when %d docCase %d widened %d unhandled %d", rep, tc.when, tc.dc, tc.widened, tc.unhandled)
+			if rep.WhenNotes != tc.when || rep.DocCaseNotes != tc.dc || len(rep.Widened) != tc.widened || rep.Dropped != tc.dropped || len(rep.Unhandled) != tc.unhandled {
+				t.Errorf("report = %+v, want when %d docCase %d widened %d dropped %d unhandled %d", rep, tc.when, tc.dc, tc.widened, tc.dropped, tc.unhandled)
 			}
 		})
 	}

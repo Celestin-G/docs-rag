@@ -31,6 +31,13 @@ func (r *Report) PrintSummary(w io.Writer, table *StackTable) {
 	if r.Excluded > 0 {
 		fmt.Fprintf(w, "  %-18s %6d\n", "excluded", r.Excluded)
 	}
+	if len(r.DatasetExcluded) > 0 {
+		total := 0
+		for _, n := range r.DatasetExcluded {
+			total += n
+		}
+		fmt.Fprintf(w, "  %-18s %6d chunks of excluded datasets\n", "excluded datasets", total)
+	}
 	fmt.Fprintf(w, "\nChunks                  %6d\n", r.Chunks)
 	fmt.Fprintf(w, "KB files                %6d\n", r.KBFiles)
 	fmt.Fprintf(w, "Re-split chunks         %6d (+%d extra files)\n", r.ResplitChunks, r.ExtraParts)
@@ -67,7 +74,25 @@ func (r *Report) PrintSummary(w io.Writer, table *StackTable) {
 		if x.Inline {
 			level = "inline"
 		}
-		fmt.Fprintf(w, "  %-6s %s  %s %s (%s)\n", level, x.File, x.Component, x.Bound, x.Reason)
+		fmt.Fprintf(w, "  %-6s %s  %s %s\n", level, x.File, x.Component, x.Bound)
+	}
+
+	pageUn, inlineUn := 0, 0
+	for _, x := range r.Unshipped {
+		if x.Inline {
+			inlineUn++
+		} else {
+			pageUn++
+		}
+	}
+	fmt.Fprintf(w, "\nEXCLUDED: no Stack release ships these ranges: %d entries (%d page-level, %d inline); %d chunks and %d inline blocks left out\n",
+		len(r.Unshipped), pageUn, inlineUn, r.UnshippedChunks, r.UnshippedBlocks)
+	for _, x := range r.Unshipped {
+		level := "page"
+		if x.Inline {
+			level = "inline"
+		}
+		fmt.Fprintf(w, "  %-6s %s  %s %s\n", level, x.File, x.Component, x.Bound)
 	}
 
 	fmt.Fprintf(w, "\nsource_url fallbacks to the site root: %d\n", len(r.URLFallbacks))
