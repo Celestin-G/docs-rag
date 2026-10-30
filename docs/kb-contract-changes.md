@@ -4,7 +4,14 @@ This page proposes changes to `docs/metadata-contract.md` in the `support-agent`
 
 Source of the values: the approved KB publisher spec (2026-10-30). Contract sections are cited as "contract section N".
 
-Default excludes: `publish-kb` leaves out the raw OpenAPI dumps `stack.oas*.json` and `membership.oas.json` by default. `api.operations`, `api.schemas` and `membership.operations` carry the same API in readable form. `--no-default-excludes` restores the dumps.
+Approved by the docs-rag owner: numeric bounds in the simple sidecar form, the product value `webhooks`, and a `#anchor` in `source_url`.
+
+Default excludes: `publish-kb` leaves out these files by default:
+
+- `stack.oas.json`, `stack.oas.enriched.json`, `stack.oas.prose.json`, `membership.oas.json` and `api.schemas.json`.
+- The dataset `cookbook.numscript.byFingerprint`, which lives inside `numscript.snippets.json`.
+
+`api.operations` and `membership.operations` carry the API in readable form. `ledger.cli-flags` is kept. `--no-default-excludes` restores every default exclude.
 
 ## 1. Summary and why
 
@@ -13,16 +20,17 @@ Default excludes: `publish-kb` leaves out the raw OpenAPI dumps `stack.oas*.json
 - A doc section applies to a range of versions, such as "from Stack v3.1, before v3.2". Bounds are written on component scales (Stack, ledger, payments, numscript interpreter).
 - Many pages have no single product. They cover the whole Stack or are shared fragments.
 
-The contract's answer to ranges is one upload per version (contract section 3, "Version format"). That multiplies chunks and cannot express open bounds or component scales. This proposal replaces it with numeric bounds on one common scale, the Stack scale.
+The contract's answer to ranges is one upload per version (contract section 3, "Version format"). That multiplies chunks and cannot express open bounds or component scales. This proposal replaces it with numeric bounds on one common scale, the Stack scale. The scalar `version` key is removed for all document types.
 
 | Change | Contract sections touched |
 | --- | --- |
-| New keys `version_min`, `version_below`, `version_component`, typed values | 3, 7, 8 |
+| New keys `version_min`, `version_below`, `version_component`, typed values | 3, 7 |
+| Remove the `version` key, no migration | 3, 5, 7, 8 |
 | Stack-scale conversion rules | 3 (new subsection) |
 | Doc mapping, `webhooks`, `source_url` fragment | 3, 5, 6, 7 |
 | One file per chunk, new key pattern | 2, 6, 7 |
 | Tickets and fiches carry the bounds | 3, 6, 7 |
-| Bot filter and unknown version | 5 |
+| Bot filter, unknown version, `source_url` rewrite | 5 |
 | Size budget | 4 |
 | Fallbacks, open questions | 5 (operators), 8 |
 
@@ -52,24 +60,26 @@ Update the validation checklist (contract section 7):
 
 | Item | Current | New |
 | --- | --- | --- |
-| Field count | "All nine fields are present. No extra keys." | "The nine original fields and `version_min` and `version_below` are present. `version_component` is present for `doc`. No keys outside these twelve." |
+| Field count | "All nine fields are present. No extra keys." | "The eight original fields (all but `version`) and `version_min` and `version_below` are present. `version_component` is present for `doc`. No keys outside these eleven." |
 | Value types | "Every value is a string. No numbers, booleans or lists." | "Every value is a string, except `version_min` and `version_below`, which are integers. No booleans, lists or floats." |
 | New | none | "`0 <= version_min < version_below <= 99999`." |
 | New | none | "`version_component`, when present, matches `^[a-z0-9._-]{1,64}$`." |
 
-### Legacy `version` during migration
+### Removing `version`
 
-`version` stays. Docs write `"any"`. Follow contract section 8 ("Removing or renaming a field"):
+The `version` key is removed from the contract for all document types. There is no migration:
 
-1. Producers write both `version` and the new keys. The validation allows both.
-2. The consumer switches its filter to `version_min` and `version_below`.
-3. Producers drop `version`, and the contract drops the row.
+- No consumer reads the new keys yet, and the KB holds no ticket or fiche.
+- `version` is replaced by `version_min` and `version_below`. Producers never write both.
+- Contract section 8 ("Removing or renaming a field") has no steps to follow. Drop the `version` row from the field table and from every example (contract sections 2, 5 and 6), and remove `version` from the "no extra keys" rule.
 
-Until step 3, the "no extra keys" rule must name `version` as allowed.
+A doc sidecar has 11 keys. A ticket or fiche sidecar has 10, because `version_component` is optional for them.
 
 ## 3. Stack-scale conversion rules
 
-The docs write bounds on several component scales. `docs-rag` converts every bound to the Stack scale with the `stack` component releases in `apps/docs/content/schema.ts`. The table is read from that file at publish time, so it holds every Stack release the file lists, upcoming ones included (v3.3 today, and v4.0 once listed). Each release lists `requires` per component. A requirement is a point version (`3.0.18`) or a range (`{min, below}`). The "shipped version" of a release for a component is the lower bound of its range, or the point version.
+The docs write bounds on several component scales. `docs-rag` converts every bound to the Stack scale with the `stack` component releases in `apps/docs/content/schema.ts`. The table is read from that file at publish time, so it holds every Stack release the file lists, upcoming ones included (v4.0 is upcoming today). Each release lists `requires` per component. A requirement is a point version (`3.0.18`) or a range (`{min, below}`). The "shipped version" of a release for a component is the lower bound of its range, or the point version.
+
+`schema.ts` is the source of truth. Revisit at the v4.0 release: the v4.0 entry is marked upcoming and can change before it ships.
 
 Add these rules as a new subsection of contract section 3, after "Version format".
 
@@ -77,23 +87,29 @@ Add these rules as a new subsection of contract section 3, after "Version format
 | --- | --- |
 | Stack bound (`v3.2`) | Convert directly with `X*100+Y`. v3.2 is 302. |
 | Component lower bound `m` | The first Stack release, in release order, whose shipped version is `>= m`. Its number is `version_min`. No release ships it: not convertible. |
-| Component upper bound `b` | The first Stack release whose shipped version is `>= b`. The feature is gone from that release, so this is `version_below`. No such release: `99999`. Example: if Stack v4.0 ships ledger 3.0.0, `below 3.0.0` gives `version_below` 400. |
+| Component upper bound `b` | The first Stack release whose shipped version is `>= b`. The feature is gone from that release, so this is `version_below`. No such release: `99999`, unless the component leaves the Stack (see "Components that leave the Stack"). Example: if Stack v4.0 ships ledger 3.0.0, `below 3.0.0` gives `version_below` 400. |
 | `numscript-interpreter` bound `m` | Ledger releases require an interpreter range. Find the first ledger release whose interpreter `below` is greater than `m`. Then convert that ledger version through the Stack table. This is a cascade: stack, ledger, numscript-interpreter. When no Stack release ships that ledger version, an upper bound gives `99999` and a lower bound is not convertible. |
 | Component `orchestration` (written `flows` in docs) | The docs name `flows` is looked up as the schema id `orchestration`. The product of the chunk is `flows`. |
 | Component not in the Stack table | `membership`, `operator`, `fctl-*`, `sdk-*` and similar: not convertible. This holds for an upper bound too: a component that no Stack release lists has no `99999` fallback. |
 | Version that cannot be parsed | Not convertible. |
 
+### Components that leave the Stack
+
+A component can disappear from a later Stack release. An upper bound is capped at the first Stack release, after one that lists the component, that no longer lists it. For example, `payments` is absent from the upcoming v4.0, so a payments bound with no upper limit gets `version_below` 400, not `99999`. A lower bound that converts at or after the cap gives an empty range. The chunk is excluded (see "Empty ranges are excluded").
+
 ### Widened chunks
 
 Widening is per bound. Only the bound that is not convertible becomes `0` (lower) or `99999` (upper). A bound that converts keeps its value. For example, a lower bound that converts to 302 with an upper bound that does not gives `[302, 99999)`. The chunk is not widened as a whole.
 
-A converted range that is empty (`version_min >= version_below`, for example because no Stack release ships the range) is widened to `[0, 99999)` and is listed with the reason "empty range after conversion". Other widened bounds are listed as "not convertible".
-
 Widening is a safe error: the bot may show a chunk that does not apply, but it never hides one that does.
 
-`docs-rag` lists every widened chunk by file in its dry-run output. The inline note in the body keeps the component bound, for example `(Applies from payments 3.3.0)`. See section 5 of this page.
+`docs-rag` lists every widened chunk by file in its dry-run output, with the reason "not convertible". The inline note in the body keeps the component bound, for example `(Applies from payments 3.3.0)`. See section 5 of this page.
 
-Open issue: a component that leaves the Stack in a later release is not capped today. The upper-bound rule only looks at releases that list the component. For example, if payments is not listed in Stack v4.0, a chunk with a payments lower bound and no upper bound gets `version_below` `99999` and stays visible on v4.0. A fix needs a rule that caps at the first release that no longer lists the component.
+### Empty ranges are excluded
+
+A converted range that is empty (`version_min >= version_below`) means that no Stack release ships the range. The chunk is excluded, not widened. An inline `<When>` block with an empty range is excluded in the same way: its paragraph is left out of the body. `docs-rag` lists every excluded chunk and block in its dry-run output, with the reason "empty range after conversion".
+
+Excluding is safe here: no supported Stack release ships the content, so no customer needs it.
 
 ## 4. Doc mapping
 
@@ -103,7 +119,6 @@ Add a "Docs" column or a subsection to contract section 3. This table states how
 | --- | --- | --- |
 | `doc_type` | `doc` | Constant. |
 | `product` | See "Product rules" below. | From frontmatter `path`, or the file name for generated data. |
-| `version` | `any` | Legacy key, constant during migration. |
 | `version_min` | Number | From the page frontmatter and `<When>` blocks, converted as in section 3. |
 | `version_below` | Number | Same. |
 | `version_component` | String | The component of the original bound. `stack` when the bound is on the Stack scale or there is no bound. |
@@ -129,17 +144,21 @@ Add a "Docs" column or a subsection to contract section 3. This table states how
 
 Contract changes for `product`:
 
-- Add `webhooks` to the allowed values (contract section 3 and the validation checklist).
+- Add `webhooks` to the allowed values (contract section 3 and the validation checklist). Approved by the docs-rag owner.
 - Keep `product` as metadata. The bot no longer filters on it (section 7 of this page). Pages that mix products make a product filter drop valid content.
+
+The contract README (section 8) lists "nine string fields". It needs the same edit for `webhooks` and for the removal of `version`.
 
 ### `source_url` rule change
 
 Contract section 3, "source_url rules", and the checklist forbid `?` and `#`. Change the rule for `doc`:
 
-- `doc`: a `#fragment` is allowed. A query string (`?`) is still forbidden.
+- `doc`: a `#fragment` is allowed. Approved by the docs-rag owner. A query string (`?`) is still forbidden.
 - `ticket` and `fiche`: unchanged.
 
-For fragments and generated data, the URL is the page that includes them. `api.*` and `stack.oas*` use `https://docs.formance.com/stack-api-reference`. `membership.*` uses `https://docs.formance.com/membership-api`. The fallback is `https://docs.formance.com/`.
+For fragments and generated data, the URL is the page that includes them. `api.*` and `stack.oas*` use `https://docs.formance.com/stack-api-reference`. `membership.*` uses `https://docs.formance.com/membership-api`. The fallback is `https://docs.formance.com/`, which is acceptable.
+
+The publisher keeps bare paths (`https://docs.formance.com/<path>`). Section 7 of this page gives the bot rule that adds the version.
 
 ## 5. Object layout change
 
@@ -171,7 +190,7 @@ Key rules:
 | Reason | Detail |
 | --- | --- |
 | Metadata per section | Each section has its own bounds, license and `source_url` anchor. One file per page cannot carry that. |
-| No re-split | Chunks are at most about 1800 bytes (about 500 tokens). The KB semantic chunker (512 tokens max) does not cut them again, so the breadcrumb and the metadata stay with the text. A larger chunk is split on paragraph or line boundaries, with the breadcrumb repeated in each part. |
+| Small files | The KB keeps one data source with semantic chunking (512 tokens max) for the whole KB. `docs-rag` re-splits files to about 1500 bytes on paragraph or line boundaries, with the breadcrumb repeated in each part. A file usually stays under 512 tokens. There is no guarantee: the KB may still re-split code-heavy files. |
 | Stable keys | A key depends on the section name, not its position. Inserting a section does not rename the others. A rename is a delete plus a create, so stable keys keep syncs small. |
 | Safe deletion | `docs-rag` lists everything under `docs/`, compares a `sha256` of body plus sidecar (stored as S3 user metadata), and deletes stale keys and orphan sidecars. It never deletes outside `docs/`. It refuses when deletes exceed 20% of existing objects, unless `--allow-mass-delete` is set. |
 | No version in the key | The version is metadata now. The same chunk is not uploaded once per version. |
@@ -181,7 +200,7 @@ Key rules:
 The body starts with the breadcrumb (`Title > H2 > H3`). Add this to the contract as a body convention for docs:
 
 - An `Applies to:` line follows the breadcrumb when the page is gated. It lists Stack versions, Enterprise Edition, Cloud or self-hosted, the new Numscript interpreter, and Experimental.
-- Inline conditional blocks (`<When>`) are not flattened. The paragraph stays with an inline note: `(Applies from Stack v3.2)`, `(Applies before Stack v3.2)`, `(Applies from Stack v3.1, before v3.2)`, `(Applies to self-hosted)`, `(Applies to Enterprise Edition)`.
+- Inline conditional blocks (`<When>`) are not flattened. The paragraph stays with an inline note: `(Applies from Stack v3.2)`, `(Applies before Stack v3.2)`, `(Applies from Stack v3.1, before v3.2)`, `(Applies to self-hosted)`, `(Applies to Enterprise Edition)`. A block whose range no Stack release ships is excluded (section 3 of this page).
 - A bound that is not convertible keeps a component note, for example `(Applies from payments 3.3.0)`.
 - `<DocCase value="ee">` gets `(Enterprise Edition)`. `<DocCase value="oss">` gets `(Open source edition)`.
 
@@ -193,18 +212,16 @@ Update the examples in contract section 2 ("Sidecar file") and section 6 ("doc")
 
 A numeric condition excludes vectors that lack the key. This is the same behavior as `in` (contract section 3, `client_id`). A ticket or fiche without `version_min` and `version_below` would be invisible once the bot uses the numeric filter.
 
-Add to the field table and the checklist: tickets and fiches MUST carry `version_min` and `version_below`.
+Add to the field table and the checklist: tickets and fiches MUST carry `version_min` and `version_below`. They no longer carry `version`. The producer reads the version of the ticket or fiche and writes the bounds from it.
 
-| Source `version` | `version_min` | `version_below` |
+| Ticket or fiche version | `version_min` | `version_below` |
 | --- | --- | --- |
 | Exact `vX.Y` | `X*100+Y` | `X*100+Y+1` |
 | `any` | `0` | `99999` |
 
-Example: `v2.3` gives `[203, 204)`. For tickets and fiches, `version` is the version of the Stack, as the customer profile reports it. See the open questions.
+Example: `v2.3` gives `[203, 204)`. For tickets and fiches, the version is the version of the Stack, as the customer profile reports it. See the open questions.
 
 The minor is 99 or less (section 2 of this page). So `vX.99` gives `[X*100+99, (X+1)*100)`, which touches `v(X+1).0` and never overlaps it. An overlap would need a minor of 100 or more, such as `v2.100` landing on 300, and producers reject that.
-
-`version` stays during migration, as in section 2 of this page.
 
 ## 7. Bot filter
 
@@ -232,8 +249,14 @@ The filter has 5 conditions. AWS allows up to 5 groups in an `andAll` (contract 
 
 ### Unknown customer Stack version
 
+The customer profile does not expose the Stack version yet. Until it does, the bot always applies this rule:
+
 - If the Stack version is unknown, the bot drops both version conditions. The filter has 3 conditions.
 - The bot fails closed on `client_id` only. It never fails closed on version. A missing version must not hide the docs.
+
+### `source_url` and the customer version
+
+When the customer version is known, the bot rewrites `source_url` to the customer's version path, for example `https://docs.formance.com/v3.1/<path>`. The publisher does not do this: it keeps the bare path. Add the rewrite to the bot rules in contract section 5.
 
 ### Text changes in contract section 5
 
@@ -251,21 +274,21 @@ Update contract section 4. Same method: compact JSON, ASCII, entry = key with qu
 
 | Key | Key bytes (with quotes) | Colon | Worst value | Value bytes | Entry bytes |
 | --- | --- | --- | --- | --- | --- |
-| 9 original keys | | | | | 449 (from contract section 4) |
+| 8 original keys (all but `version`) | | | | | 429 (449 from contract section 4, minus 20 for `version`) |
 | `version_min` | 13 | 1 | `99999` | 5 | 19 |
 | `version_below` | 15 | 1 | `99999` | 5 | 21 |
 | `version_component` | 19 | 1 | 64 characters | 66 | 86 |
 
-- Entries: 449 + 19 + 21 + 86 = 575 bytes.
-- Commas between 12 entries: 11 bytes. Total 586 bytes. This is the serialized `metadataAttributes` object.
-- Wrapper `{"metadataAttributes":{` (23 bytes) and `}}` (2 bytes): 25 bytes. Total 611 bytes with the wrapper. Treat this as the conservative figure.
+- Entries: 429 + 19 + 21 + 86 = 555 bytes.
+- Commas between 11 entries: 10 bytes. Total 565 bytes. This is the serialized `metadataAttributes` object.
+- Wrapper `{"metadataAttributes":{` (23 bytes) and `}}` (2 bytes): 25 bytes. Total 590 bytes with the wrapper. Treat this as the conservative figure.
 
-The producer's 900-byte limit counts only the serialized `metadataAttributes` object (`internal/kbpublish/sidecar.go`, `attributesSize`), so the worst case is 586 bytes. With the wrapper it is 611 bytes. Both are under the 900-byte limit and the 1 KB KB limit. The key count is 12 of 35. A realistic doc (`doc_type` `doc`, `version` `any`, `client_id` `none`, a 10-character date, a 21-character component) is about 500 bytes without the wrapper.
+The producer's 900-byte limit counts only the serialized `metadataAttributes` object (`internal/kbpublish/sidecar.go`, `attributesSize`), so the worst case is 565 bytes. With the wrapper it is 590 bytes. Both are under the 900-byte limit and the 1 KB KB limit. The key count is 11 of 35. A realistic doc (`doc_type` `doc`, `client_id` `none`, a 10-character date, a 21-character component) is about 485 bytes without the wrapper.
 
 Index impact:
 
 - `version_min`, `version_below` and `version_component` are not in the non-filterable list (`AMAZON_BEDROCK_TEXT`, `AMAZON_BEDROCK_METADATA`, `source_url`, `updated_at`). They need no index recreation.
-- Existing objects need a re-upload of their sidecars and a sync (contract section 8, "Adding a filterable field").
+- The KB holds no ticket or fiche yet, so there are no existing sidecars to migrate. Documents are published with the new keys from the first sync.
 
 ## 9. Status of the numeric operators
 
@@ -282,18 +305,20 @@ Index impact:
 
 Why this needs care: with `in`, the metadata value must be a scalar and the filter lists the candidate values. A per-chunk scalar cannot express a range. A range needs either a comparison, a list value, or one copy per version.
 
+The primary design drops the `version` key. Option C below is a fallback that brings back a scalar `version` key, for that option only. Use it only if the numeric filters and `listContains` both fail.
+
 | Option | Idea | Pros | Cons | Test needed |
 | --- | --- | --- | --- | --- |
 | A. `stack_versions` list | Key `stack_versions`, type STRING_LIST. It lists every compatible Stack version, for example `["v3.1","v3.2"]`. The bot filters with `listContains`. | One copy per chunk. Keeps the range model. | `listContains` is untested. Open ranges must list every supported version, so each Stack release forces a re-upload of open-ended chunks. Lists use bytes. | A `listContains` check, inside `andAll`. `kb-verify.sh` does not test it, because the docs publish no STRING_LIST key. It needs dedicated fixtures, for example an extension of the support-agent smoke test. |
 | B. One key per version | A key such as `v3_1: true` per version. | Uses `equals`. | Key explosion. 35 keys per vector. Every release adds a key and the producers must set all of them. | None. Rejected. |
-| C. One copy per version | Scalar `version` string. Upload one copy of each versioned chunk per supported Stack version. The bot filters with `in ["v3.1","any"]`. | Uses only `in`, which is tested. This is the current contract's approach. | About N copies of every versioned chunk, where N is the number of supported Stack versions. The key must carry the version again (`docs/<product>/<version>/...`). Duplicate hits in results. | None beyond the existing smoke test. |
+| C. One copy per version (fallback: reintroduces scalar `version`) | Scalar `version` string, written per copy. Upload one copy of each versioned chunk per supported Stack version. The bot filters with `in ["v3.1","any"]`. | Uses only `in`, which is tested. This is the current contract's approach. | About N copies of every versioned chunk, where N is the number of supported Stack versions. The key must carry the version again (`docs/<product>/<version>/...`). Duplicate hits in results. | None beyond the existing smoke test. |
 
 `in` with a STRING_LIST key does not help. `in` compares a scalar value to a list given in the filter. It does not test whether a stored list contains a value.
 
 ### Recommendation
 
 1. Try A first (`listContains`).
-2. If `listContains` also fails, use C. It costs about N copies of versioned chunks. Chunks with no version bound use `any` and stay single.
+2. If `listContains` also fails, use C. It costs about N copies of versioned chunks and brings `version` back as a scalar key on those copies. Chunks with no version bound use `any` and stay single.
 
 ### Size of option A
 
@@ -304,7 +329,7 @@ Key `"stack_versions"` is 16 bytes with quotes, plus 1 colon. A list of 10 versi
 | Realistic | `"v3.1"` | 6 | 10 x 6 + 9 commas + 2 brackets = 71 | 16 + 1 + 71 = 88 |
 | Worst case | `"v999.999"` | 10 | 10 x 10 + 9 commas + 2 brackets = 111 | 16 + 1 + 111 = 128 |
 
-The worst case sidecar has the 9 original entries (449) plus 128, so 577 bytes. With 9 commas (10 entries) the `metadataAttributes` object is 586 bytes, the figure the 900-byte limit counts. With the 25-byte wrapper the conservative total is 611 bytes. Both fit in 900 bytes. Assumption: list values count as their serialized bytes in the 1 KB budget. Confirm this with the test.
+The worst case sidecar has the 8 original entries without `version` (429) plus 128, so 557 bytes. With 8 commas (9 entries) the `metadataAttributes` object is 565 bytes, the figure the 900-byte limit counts. With the 25-byte wrapper the conservative total is 590 bytes. Both fit in 900 bytes. Assumption: list values count as their serialized bytes in the 1 KB budget. Confirm this with the test.
 
 ### Filter for v3.1, cloud, EE under each fallback
 
@@ -323,9 +348,9 @@ Option A (4 conditions, with room for `product` as a fifth):
 
 A chunk valid for every version must list every supported version, because `listContains` has no `any`.
 
-Filling `stack_versions`: docs list every supported Stack version inside `[version_min, version_below)`. Tickets and fiches have an exact `vX.Y`, so the list is `["vX.Y"]`. A ticket or fiche with `version` `any` lists every supported Stack version.
+Filling `stack_versions`: docs list every supported Stack version inside `[version_min, version_below)`. Tickets and fiches have an exact `vX.Y`, so the list is `["vX.Y"]`. A ticket or fiche with version `any` lists every supported Stack version.
 
-Option C (4 conditions, with room for `product` as a fifth):
+Option C (4 conditions, with room for `product` as a fifth). This is the only place the scalar `version` key is used:
 
 ```json
 {
@@ -342,10 +367,7 @@ Both stay within the 5-condition limit. For an unknown Stack version, drop the v
 
 ## 11. Open questions for the contract owner
 
-1. Which version does the customer profile API return: the Stack version or a module version? The new scale is the Stack scale, and the bot needs the Stack version. The contract does not say.
-2. Where do the ticket and fiche producers get the bound? Is `version` on a ticket the Stack version?
+1. Where do the ticket and fiche producers get the bound? Is the version on a ticket the Stack version?
+2. When will the customer profile API return the Stack version, and not a module version? The new scale is the Stack scale. Until then the bot uses the unknown-version rule (section 7 of this page), which needs no answer.
 3. Is the minor-above-99 limit acceptable? The old pattern allows `v999.999`.
 4. Is `version_component` required for tickets and fiches, or optional as proposed here?
-5. When should producers drop `version` (step 3 of the migration)? Name an owner and a date.
-6. Is the `source_url` fragment limit still 200 bytes with the anchor included?
-7. Should the contract name `webhooks` in the README section 8 text, which lists "nine string fields"? The README needs the same edit.

@@ -185,7 +185,7 @@ This is exactly what the GitHub Action does automatically every day at 08:00 UTC
 
 It reuses the chunker and the metadata extraction. The knowledge base computes the embeddings and stores the vectors. The command:
 
-1. Builds one markdown file per chunk under `docs/`, each with a `<name>.md.metadata.json` sidecar. The metadata mapping is in [docs/kb-contract-changes.md](docs/kb-contract-changes.md).
+1. Builds one markdown file per chunk under `docs/`, each with a `<name>.md.metadata.json` sidecar. A chunk over about 1500 bytes is re-split, with the breadcrumb repeated in each part. A chunk whose version range no Stack release ships is excluded and listed in the dry-run. The metadata mapping is in [docs/kb-contract-changes.md](docs/kb-contract-changes.md).
 2. Validates every key and every sidecar.
 3. Diffs the files against `s3://<bucket>/docs/`. Each object carries the `x-amz-meta-sha256` of its body plus sidecar, and a file whose hash matches is left alone.
 4. Uploads the new and changed files, then deletes the stale objects.
@@ -193,14 +193,11 @@ It reuses the chunker and the metadata extraction. The knowledge base computes t
 
 ### Build
 
-The real publish needs the Bedrock Agent SDK module, which is not in `go.mod`. The code that starts ingestion jobs (`internal/kbpublish/aws_bedrock.go`) compiles only with the `bedrockagent` build tag.
+The Bedrock Agent adapter (`internal/kbpublish/aws_bedrock.go`) builds by default. Its dependency, `github.com/aws/aws-sdk-go-v2/service/bedrockagent` v1.69.2, is pinned in `go.mod`.
 
 ```bash
-go get github.com/aws/aws-sdk-go-v2/service/bedrockagent
-go build -tags bedrockagent -o rag .
+go build -o rag .
 ```
-
-The default build (`go run .`, `go build`) still runs every dry run. It refuses `--dry-run=false` before it writes anything (`internal/kbpublish/aws_nobedrock.go`). The examples below use the `rag` binary built with the tag.
 
 ### Usage
 
@@ -242,21 +239,25 @@ A flag wins over its environment variable.
 | `--force-sync` | — | `false` | Start an ingestion job even when nothing changed. |
 | `--timeout` | — | `30m` | How long to wait for the ingestion job. |
 | `--exclude` | — | — | Glob on repo-relative paths to leave out, added to the default excludes. Repeatable. |
-| `--no-default-excludes` | — | `false` | Publish the raw OpenAPI dumps too. |
+| `--exclude-dataset` | — | — | Dataset to leave out, added to the default dataset excludes. Repeatable. |
+| `--no-default-excludes` | — | `false` | Publish the default-excluded files and datasets too. |
 | `--verbose` | — | `false` | List every key of the diff. |
 
-Excluding a file that is already published deletes it from the bucket, subject to the 20% delete guard.
+Excluding a file or dataset that is already published deletes it from the bucket, subject to the 20% delete guard.
 
 ### Default excludes
 
-These raw OpenAPI dumps are left out unless you pass `--no-default-excludes`:
+These files are left out unless you pass `--no-default-excludes`:
 
 - `apps/docs/content/data/generated/stack.oas.json`
 - `apps/docs/content/data/generated/stack.oas.enriched.json`
 - `apps/docs/content/data/generated/stack.oas.prose.json`
 - `apps/docs/content/data/generated/membership.oas.json`
+- `apps/docs/content/data/generated/api.schemas.json`
 
-The same API is published in readable form from the `api.operations`, `api.schemas` and `membership.operations` datasets, so the dumps would duplicate it.
+The dataset `cookbook.numscript.byFingerprint` (inside `numscript.snippets.json`) is also left out. Add more datasets with `--exclude-dataset`. `ledger.cli-flags` is kept.
+
+The readable `api.operations` and `membership.operations` datasets still publish the API.
 
 ### Safety
 
@@ -264,7 +265,12 @@ The same API is published in readable form from the `api.operations`, `api.schem
 - It refuses a run that would delete more than 20% of the existing objects, which usually means a wrong `DOCS_PATH` or a broken parse. Pass `--allow-mass-delete` to override. The guard also applies to the online dry run.
 - Validation stops the run before any AWS call. A file that fails to parse, a validation error, or an empty result produces an error and nothing is published.
 - Uploads write the sidecar first, so a body never exists without its metadata.
-- When nothing changed, the command still checks the latest ingestion job. It waits for a running job, and starts a new one if the last job failed, was stopped, or had failed documents. If the last job completed cleanly, no job starts. `--force-sync` always starts one.
+- When nothing changed, the command still starts a sync, so a crashed earlier run is resumed. It skips the sync only when the latest docs-rag ingestion job meets all three conditions:
+  - It is `COMPLETE` with 0 failed documents.
+  - It started after the newest object under `docs/` was modified.
+  - Its description carries the current plan hash (`docs-rag plan=<sha256>`, computed from the sorted list of keys and hashes). The hash also catches a crash after a delete-only run, because deleted objects leave no modification date.
+
+  The command waits for a running job, then checks again. `--force-sync` always starts one.
 - An ingestion error suggests re-running with `--force-sync`.
 - Exit codes: `0` on success, `1` on any error (including validation, the delete guards, and a failed ingestion job).
 
@@ -296,6 +302,8 @@ Run the offline tests of the script with:
 ```bash
 bash tests/kb-verify/run.sh
 ```
+
+CI (`.github/workflows/test.yml`) has a build job and runs these offline tests.
 
 ---
 
@@ -383,6 +391,7 @@ docs/
   kb-contract-changes.md  Metadata contract of the knowledge base
 .github/workflows/
   update-docs.yml    Daily automated docs re-ingestion (08:00 UTC)
+  test.yml           Lint, build, tests and the kb-verify offline tests
 nginx.conf           Production reverse proxy (rate limit, SSE, timeouts)
 docker-compose.yml   PostgreSQL + pgvector
 ```
