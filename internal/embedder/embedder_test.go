@@ -1,12 +1,14 @@
 package embedder
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -217,6 +219,13 @@ func TestEmbedBatchRetry(t *testing.T) {
 			wantCalls: 2,
 		},
 		{
+			// 2026-10-30: the transport's header timeout matches
+			// context.DeadlineExceeded, and was mistaken for the caller giving up.
+			name:      "response header timeout is retried",
+			first:     func(w http.ResponseWriter, r *http.Request) { time.Sleep(200 * time.Millisecond) },
+			wantCalls: 2,
+		},
+		{
 			name:      "4xx is not retried",
 			first:     func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusBadRequest) },
 			wantCalls: 1,
@@ -224,10 +233,9 @@ func TestEmbedBatchRetry(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			calls := 0
+			var calls atomic.Int32
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				calls++
-				if calls == 1 {
+				if calls.Add(1) == 1 {
 					tc.first(w, r)
 					return
 				}
@@ -235,12 +243,14 @@ func TestEmbedBatchRetry(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			e := &Embedder{host: srv.URL, client: srv.Client(), retryDelays: []time.Duration{time.Millisecond}}
+			client := srv.Client()
+			client.Transport.(*http.Transport).ResponseHeaderTimeout = 50 * time.Millisecond
+			e := &Embedder{host: srv.URL, client: client, retryDelays: []time.Duration{time.Millisecond}}
 			_, err := e.EmbedBatch(t.Context(), []string{"a"})
 			if (err != nil) != tc.wantErr {
 				t.Errorf("err = %v, wantErr %v", err, tc.wantErr)
 			}
-			if calls != tc.wantCalls {
+			if calls := int(calls.Load()); calls != tc.wantCalls {
 				t.Errorf("calls = %d, want %d", calls, tc.wantCalls)
 			}
 		})
@@ -261,5 +271,50 @@ func TestEmbedBatchGivesUpAfterRetries(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Errorf("calls = %d, want 3 (1 attempt + 2 retries)", calls)
+	}
+}
+
+func TestEmbedBatchStopsWhenCallerCancels(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	e := &Embedder{host: srv.URL, client: srv.Client(), retryDelays: []time.Duration{time.Hour}}
+	if _, err := e.EmbedBatch(ctx, []string{"a"}); err == nil {
+		t.Error("expected an error from a cancelled context, got nil")
+	}
+}
+
+// TestBatchesBoundBytes covers the 2026-10-30 failure: two ~2048-token
+// OpenAPI chunks in one request outlived the response header timeout.
+func TestBatchesBoundBytes(t *testing.T) {
+	small, big := "x", strings.Repeat("y", maxBatchBytes+1)
+	for _, tc := range []struct {
+		name  string
+		texts []string
+		want  []int
+	}{
+		{name: "count cap", texts: slices.Repeat([]string{small}, embedBatchSize+1), want: []int{embedBatchSize, 1}},
+		{name: "oversized texts go alone", texts: []string{small, big, big, small}, want: []int{1, 1, 1, 1}},
+		{name: "byte cap closes a batch", texts: []string{strings.Repeat("z", maxBatchBytes/2+1), strings.Repeat("z", maxBatchBytes/2+1)}, want: []int{1, 1}},
+		{name: "empty", texts: nil, want: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []int
+			var joined []string
+			for _, b := range batches(tc.texts) {
+				got = append(got, len(b))
+				joined = append(joined, b...)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("batch sizes = %v, want %v", got, tc.want)
+			}
+			if !slices.Equal(joined, tc.texts) {
+				t.Error("batches did not preserve every text in order")
+			}
+		})
 	}
 }
