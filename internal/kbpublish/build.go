@@ -82,6 +82,9 @@ type Report struct {
 	Unshipped       []Exclusion
 	UnshippedChunks int
 	UnshippedBlocks int
+	// Gaps: ranges that overlap non-adjacent Stack releases; converted to a
+	// superset (see Conversion.NonContiguous).
+	Gaps            []Widening
 	URLFallbacks    []string
 	AnchorMisses    []string
 	Unhandled       []string
@@ -145,6 +148,9 @@ func Build(sources []SourceFile, opts Options) *Plan {
 		for _, w := range inl.Widened {
 			addWidening(rep, seenWiden, w)
 		}
+		for _, g := range inl.Gaps {
+			addGap(rep, seenWiden, g)
+		}
 		for _, x := range inl.Excluded {
 			addExclusion(rep, seenWiden, x)
 		}
@@ -195,7 +201,7 @@ func Build(sources []SourceFile, opts Options) *Plan {
 		}
 	}
 
-	for _, list := range [][]Widening{rep.Widened, rep.Unshipped} {
+	for _, list := range [][]Widening{rep.Widened, rep.Unshipped, rep.Gaps} {
 		sort.Slice(list, func(i, j int) bool {
 			a, b := list[i], list[j]
 			if a.File != b.File {
@@ -242,6 +248,15 @@ func addWidening(rep *Report, seen map[string]bool, w Widening) {
 	}
 	seen[id] = true
 	rep.Widened = append(rep.Widened, w)
+}
+
+func addGap(rep *Report, seen map[string]bool, g Widening) {
+	id := fmt.Sprintf("g|%s|%v|%s|%s", g.File, g.Inline, g.Component, g.Bound)
+	if seen[id] {
+		return
+	}
+	seen[id] = true
+	rep.Gaps = append(rep.Gaps, g)
 }
 
 func addExclusion(rep *Report, seen map[string]bool, x Exclusion) {
@@ -317,6 +332,9 @@ func (fc *fileContext) files(c chunker.Chunk, p *Plan, seenWiden map[string]bool
 	}
 	if conv.Widened() {
 		addWidening(fc.rep, seenWiden, widening(rel, false, conv))
+	}
+	if conv.NonContiguous {
+		addGap(fc.rep, seenWiden, widening(rel, false, conv))
 	}
 	updated, _ := fc.opts.Dates.Date(rel)
 

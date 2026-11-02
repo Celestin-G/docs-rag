@@ -36,6 +36,9 @@ type InlineReport struct {
 	// deduplicated).
 	Excluded []Exclusion
 	Dropped  int
+	// Gaps lists blocks whose range overlaps non-adjacent releases (see
+	// Conversion.NonContiguous).
+	Gaps []Widening
 	// Unhandled lists <When> or <DocCase> occurrences the rewriter did not
 	// understand (an opening tag followed by text on the same line, say). They are
 	// left to the chunker, which strips the tag, and reported so none is silent.
@@ -219,6 +222,9 @@ func RewriteInline(rel string, raw []byte, t *StackTable) ([]byte, InlineReport)
 		}
 		if conv.Widened() {
 			rep.Widened = append(rep.Widened, widening(rel, true, conv))
+		}
+		if conv.NonContiguous {
+			rep.Gaps = append(rep.Gaps, widening(rel, true, conv))
 		}
 		if note != "" {
 			out = append(out, note, "")
