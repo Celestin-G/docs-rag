@@ -185,8 +185,8 @@ This is exactly what the GitHub Action does automatically every day at 08:00 UTC
 
 It reuses the chunker and the metadata extraction. The knowledge base computes the embeddings and stores the vectors. The command:
 
-1. Builds one markdown file per chunk under `docs/`, each with a `<name>.md.metadata.json` sidecar. A chunk over about 1500 bytes is re-split, with the breadcrumb repeated in each part. A chunk whose version range no Stack release ships is excluded and listed in the dry-run. The metadata mapping is in [docs/kb-contract-changes.md](docs/kb-contract-changes.md).
-2. Validates every key and every sidecar.
+1. Builds one markdown file per chunk under `docs/`, each with a `<name>.md.metadata.json` sidecar. A chunk over about 1500 bytes or 400 estimated tokens is re-split, with the breadcrumb repeated in each part. Re-splits use paragraph or line boundaries. A code block over the budget is split at line boundaries, and each part closes and reopens its code fence. A file usually stays under 512 tokens. The token estimate is conservative: text inside code fences and lines with more than 12% symbol characters count 2 characters per token, prose 4, and each non-ASCII character 1 token (`internal/kbpublish/tokens.go`). The dry run reports the chunks re-split for tokens and the largest estimate. A chunk whose version range no Stack release ships is excluded and listed in the dry-run. The metadata mapping is in [docs/kb-contract-changes.md](docs/kb-contract-changes.md).
+2. Validates every key, every sidecar and the token budget of every file. A file over 400 estimated tokens is refused.
 3. Diffs the files against `s3://<bucket>/docs/`. Each object carries the `x-amz-meta-sha256` of its body plus sidecar, and a file whose hash matches is left alone.
 4. Uploads the new and changed files, then deletes the stale objects.
 5. Starts one ingestion job, waits for it, and prints its statistics and failure reasons.
@@ -416,4 +416,3 @@ docker-compose.yml   PostgreSQL + pgvector
 - **Vanilla JS** — embedded web UI, no build step, SSE streaming
 - **nginx + GitHub Actions** — production edge (rate limit, SSE passthrough) and daily automated index updates
 - **Amazon Bedrock Knowledge Base** — target of `publish-kb` (S3 Vectors, `eu-west-1`), which does its own embeddings
-
