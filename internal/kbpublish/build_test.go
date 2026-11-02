@@ -2,9 +2,12 @@ package kbpublish
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 type fakeDates map[string]string
@@ -473,5 +476,148 @@ func TestBuildDatasetExcludes(t *testing.T) {
 	}
 	if !excluded("cookbook.numscript.byFingerprint", DefaultDatasetExcludes) || excluded("cookbook.numscript.snippets", DefaultDatasetExcludes) {
 		t.Errorf("default dataset excludes = %v", DefaultDatasetExcludes)
+	}
+}
+
+// fixtureFile reads a published file that failed ingestion and returns its
+// breadcrumb/header prefix (the first prefixLines lines, or fallback) and body.
+func fixtureFile(t *testing.T, name string, prefixLines int, fallback string) (prefix, body string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if prefixLines == 0 {
+		return fallback, text
+	}
+	lines := strings.SplitN(text, "\n", prefixLines+1)
+	return strings.Join(lines[:prefixLines], "\n"), strings.TrimLeft(lines[prefixLines], "\n")
+}
+
+func TestRejectedFixturesSplitUnderTokenBudget(t *testing.T) {
+	for _, tc := range []struct {
+		file        string
+		prefixLines int
+		fallback    string
+	}{
+		{"numscript-snippets-27-p3.md", 0, "S"},
+		{"combine-conditions-2.md", 2, ""},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			prefix, body := fixtureFile(t, tc.file, tc.prefixLines, tc.fallback)
+			if n := estimateTokens(prefix + "\n\n" + body); n <= maxFileTokens {
+				t.Fatalf("fixture is estimated at %d tokens, want > %d", n, maxFileTokens)
+			}
+			parts, byteOnly := splitForBudgets(prefix, body)
+			if len(parts) <= byteOnly {
+				t.Errorf("%d parts, byte budget alone gives %d: the split is not token-driven", len(parts), byteOnly)
+			}
+			for i, part := range parts {
+				text := prefix + "\n\n" + part
+				if n := estimateTokens(text); n > maxFileTokens {
+					t.Errorf("part %d is %d tokens", i+1, n)
+				}
+				if len(text) > maxFileBytes {
+					t.Errorf("part %d is %d bytes", i+1, len(text))
+				}
+				if strings.TrimSpace(part) == "" || !strings.HasPrefix(text, prefix) {
+					t.Errorf("part %d is empty or lost the prefix", i+1)
+				}
+				if c := strings.Count(part, "```"); c%2 != 0 {
+					t.Errorf("part %d has %d fence markers:\n%s", i+1, c, part)
+				}
+			}
+		})
+	}
+}
+
+func TestEstimateTokens(t *testing.T) {
+	prose := strings.Repeat("The ledger records every transaction. ", 10) // 380 chars
+	code := "```go\n" + strings.Repeat("x := foo(bar)\n", 10) + "```"
+	for _, tc := range []struct {
+		name     string
+		text     string
+		min, max int
+	}{
+		{"empty", "", 1, 1},
+		{"prose at 4 chars per token", prose, 95, 100},
+		{"code fence at 2 chars per token", code, 75, 90},
+		{"symbol-heavy line outside a fence", strings.Repeat(`{"a":[1,2]}`, 10), 55, 60},
+		{"non-ASCII counts one token per rune", strings.Repeat("é", 100), 100, 102},
+	} {
+		if got := estimateTokens(tc.text); got < tc.min || got > tc.max {
+			t.Errorf("%s: %d tokens, want %d..%d", tc.name, got, tc.min, tc.max)
+		}
+	}
+	if a, b := estimateTokens(code), estimateTokens(strings.ReplaceAll(code, "```", "")); a <= b {
+		t.Errorf("fenced text (%d) must cost at least as much as the same text unfenced (%d)", a, b)
+	}
+}
+
+func TestSplitForBudgetsHugeCodeLine(t *testing.T) {
+	prefix := "Page > Section\nApplies to: Stack v4.0 and later"
+	for name, line := range map[string]string{
+		"with spaces": strings.TrimSpace(strings.Repeat("alpha(beta, gamma) ", 120)),
+		"no spaces":   strings.Repeat("a1{}", 700),
+		"multibyte":   strings.Repeat("é", 900),
+	} {
+		t.Run(name, func(t *testing.T) {
+			parts, _ := splitForBudgets(prefix, "```text\n"+line+"\n```")
+			if len(parts) < 2 {
+				t.Fatalf("one huge line stayed in %d part", len(parts))
+			}
+			var joined strings.Builder
+			for i, p := range parts {
+				text := prefix + "\n\n" + p
+				if n := estimateTokens(text); n > maxFileTokens || len(text) > maxFileBytes {
+					t.Errorf("part %d: %d tokens, %d bytes", i+1, n, len(text))
+				}
+				if !strings.HasPrefix(p, "```text\n") || !strings.HasSuffix(p, "\n```") || !utf8.ValidString(p) {
+					t.Errorf("part %d is not a closed text fence on valid UTF-8: %.40q", i+1, p)
+				}
+				joined.WriteString(strings.NewReplacer(" ", "", "\n", "").Replace(strings.TrimSuffix(strings.TrimPrefix(p, "```text\n"), "\n```")))
+			}
+			if joined.String() != strings.ReplaceAll(line, " ", "") {
+				t.Error("pieces do not add up to the original line")
+			}
+		})
+	}
+}
+
+func TestSplitForBudgetsKeepsSmallFilesUnchanged(t *testing.T) {
+	prefix := "A > B\nApplies to: Stack v4.0 and later"
+	for name, body := range map[string]string{
+		"prose":      strings.Repeat("Short prose. ", 20),
+		"small code": "```bash\nls -la\n```",
+		"fits both":  strings.Repeat("word ", 200), // ~1000 bytes, ~250 tokens
+	} {
+		parts, byteOnly := splitForBudgets(prefix, body)
+		if len(parts) != 1 || parts[0] != body || byteOnly != 1 {
+			t.Errorf("%s: got %d parts (byte-only %d), want the body untouched", name, len(parts), byteOnly)
+		}
+	}
+}
+
+func TestBuildReportsTokenResplitsAndRejectsOverBudgetFiles(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("# Page\n\n## Code\n\n```json\n")
+	for range 60 {
+		sb.WriteString(`{"a":[1,2,3]}` + "\n")
+	}
+	sb.WriteString("```\n")
+	p := Build([]SourceFile{{Rel: "apps/docs/content/pages/ledger/code.mdx", Content: []byte(sb.String())}}, Options{Table: mustTable(t), Dates: fakeDates{}})
+	if len(p.Errors) != 0 {
+		t.Fatalf("errors: %v", p.Errors)
+	}
+	r := p.Report
+	if r.TokenResplitChunks == 0 || r.TokenExtraParts == 0 || r.MaxFileTokens == 0 || r.MaxFileTokens > maxFileTokens || r.MaxFileTokensKey == "" {
+		t.Errorf("token report not filled: %+v", r)
+	}
+	if errs := ValidateFileTokens(strings.Repeat("{}[]", 300)); len(errs) != 1 {
+		t.Errorf("an over-budget body must fail validation: %v", errs)
+	}
+	if errs := ValidateFileTokens("short"); len(errs) != 0 {
+		t.Errorf("a small body must pass: %v", errs)
 	}
 }

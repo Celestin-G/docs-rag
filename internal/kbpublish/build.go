@@ -90,6 +90,13 @@ type Report struct {
 	DateFallbacks   int
 	MaxSidecarBytes int
 	MaxSidecarKey   string
+	// TokenResplitChunks counts chunks cut into more files than the byte budget
+	// alone would give, because of the estimated-token budget; TokenExtraParts is
+	// the number of files that added.
+	TokenResplitChunks int
+	TokenExtraParts    int
+	MaxFileTokens      int // largest estimated token count of any file
+	MaxFileTokensKey   string
 }
 
 // Plan is the result of Build: the files to publish and everything worth
@@ -177,6 +184,9 @@ func Build(sources []SourceFile, opts Options) *Plan {
 					st.Files++
 					st.Bytes += len(f.file.Body) + len(f.file.Sidecar)
 					rep.ByDataset[k] = st
+				}
+				if f.tokens > rep.MaxFileTokens || (f.tokens == rep.MaxFileTokens && f.file.Key < rep.MaxFileTokensKey) {
+					rep.MaxFileTokens, rep.MaxFileTokensKey = f.tokens, f.file.Key
 				}
 				if n := f.sidecarBytes; n > rep.MaxSidecarBytes {
 					rep.MaxSidecarBytes, rep.MaxSidecarKey = n, f.file.Key
@@ -267,6 +277,7 @@ type builtFile struct {
 	dataset      string
 	header       bool
 	sidecarBytes int
+	tokens       int
 }
 
 type fileContext struct {
@@ -360,13 +371,14 @@ func (fc *fileContext) files(c chunker.Chunk, p *Plan, seenWiden map[string]bool
 		prefix += header
 	}
 
-	bodies := []string{body}
-	if len(prefix)+2+len(body) > maxFileBytes {
-		bodies = splitBody(body, max(maxFileBytes-len(prefix)-2, minPartBudget))
-	}
+	bodies, byteParts := splitForBudgets(prefix, body)
 	if len(bodies) > 1 {
 		fc.rep.ResplitChunks++
 		fc.rep.ExtraParts += len(bodies) - 1
+	}
+	if len(bodies) > byteParts {
+		fc.rep.TokenResplitChunks++
+		fc.rep.TokenExtraParts += len(bodies) - byteParts
 	}
 
 	// The same base key twice on a page gets -2, -3 in document order.
@@ -392,10 +404,14 @@ func (fc *fileContext) files(c chunker.Chunk, p *Plan, seenWiden map[string]bool
 		for _, e := range attrs.Validate() {
 			p.Errors = append(p.Errors, fmt.Sprintf("%s (%s): %s", rel, key, e))
 		}
+		tokens := estimateTokens(text)
+		for _, e := range ValidateFileTokens(text) {
+			p.Errors = append(p.Errors, fmt.Sprintf("%s (%s): %s", rel, key, e))
+		}
 		if strings.TrimSpace(part) == "" {
 			p.Errors = append(p.Errors, fmt.Sprintf("%s (%s): empty body", rel, key))
 		}
-		out = append(out, builtFile{file: f, product: product, dataset: dataset, header: header != "", sidecarBytes: attrs.attributesSize()})
+		out = append(out, builtFile{file: f, product: product, dataset: dataset, header: header != "", sidecarBytes: attrs.attributesSize(), tokens: tokens})
 	}
 	return out
 }
@@ -612,12 +628,27 @@ func splitBody(text string, budget int) []string {
 				opening = ""
 			}
 		}
+		if !hasContent(part) {
+			// Only fence lines: the cut fell right after an opening fence. The
+			// next part reopens it, so this one would be an empty code block.
+			continue
+		}
 		if opening != "" && i < len(parts)-1 {
 			part += "\n" + fenceMarker(opening)
 		}
 		out = append(out, part)
 	}
 	return out
+}
+
+// hasContent reports whether part has a line that is neither blank nor a fence.
+func hasContent(part string) bool {
+	for line := range strings.SplitSeq(part, "\n") {
+		if t := strings.TrimSpace(line); t != "" && !strings.HasPrefix(t, "```") {
+			return true
+		}
+	}
+	return false
 }
 
 // fenceMarker returns the run of backticks that opens a fence line.

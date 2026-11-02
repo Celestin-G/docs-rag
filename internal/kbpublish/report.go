@@ -41,6 +41,8 @@ func (r *Report) PrintSummary(w io.Writer, table *StackTable) {
 	fmt.Fprintf(w, "\nChunks                  %6d\n", r.Chunks)
 	fmt.Fprintf(w, "KB files                %6d\n", r.KBFiles)
 	fmt.Fprintf(w, "Re-split chunks         %6d (+%d extra files)\n", r.ResplitChunks, r.ExtraParts)
+	fmt.Fprintf(w, "Token re-splits         %6d chunks (+%d extra files, budget %d estimated tokens)\n", r.TokenResplitChunks, r.TokenExtraParts, maxFileTokens)
+	fmt.Fprintf(w, "Max file tokens         %6d estimated (limit %d) %s\n", r.MaxFileTokens, maxFileTokens, r.MaxFileTokensKey)
 	fmt.Fprintf(w, "Applies-to headers      %6d files\n", r.Headers)
 	fmt.Fprintf(w, "Inline <When> notes     %6d\n", r.WhenNotes)
 	fmt.Fprintf(w, "Inline <DocCase> notes  %6d\n", r.DocCaseNotes)
