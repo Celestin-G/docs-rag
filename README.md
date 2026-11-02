@@ -305,6 +305,15 @@ bash tests/kb-verify/run.sh
 
 CI (`.github/workflows/test.yml`) has a build job and runs these offline tests.
 
+### Before automating publish-kb
+
+Manual runs are safe as they are. These items are required before `publish-kb` runs unattended (CI, cron):
+
+- [ ] **Per-bucket lock.** `publish-kb` has no lock today, so two publishers can interleave uploads and deletes. Take a lock object in the source bucket with an S3 conditional write (`If-None-Match: *`) for the whole run, through ingestion. Run automated publishes in a single CI concurrency group.
+- [ ] **Unsynced-changes marker.** Write a marker before any S3 change, and clear it only after a successful ingestion job. A crash after deletes then always triggers a sync on the next run. Today's plan-hash check misses a delete-only crash that returns to an older plan when another writer has touched `docs/`.
+- [ ] **Failure-injection tests.** Cover a failure between the sidecar and body writes, and a failure midway through deletions. Rerun each, then assert the stored bytes and that ingestion runs.
+- [ ] **Retry test for `ConflictException`.** Add a dedicated test that `Syncer.Run` retries on `ConflictException` (another ingestion job running) until `--timeout`, for both changed and `--force-sync` runs.
+
 ---
 
 ## CLI reference
@@ -407,3 +416,4 @@ docker-compose.yml   PostgreSQL + pgvector
 - **Vanilla JS** — embedded web UI, no build step, SSE streaming
 - **nginx + GitHub Actions** — production edge (rate limit, SSE passthrough) and daily automated index updates
 - **Amazon Bedrock Knowledge Base** — target of `publish-kb` (S3 Vectors, `eu-west-1`), which does its own embeddings
+
