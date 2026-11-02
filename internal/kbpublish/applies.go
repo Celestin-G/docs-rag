@@ -21,6 +21,10 @@ type Conversion struct {
 	// Capped marks an upper bound set by the component leaving the Stack (absent
 	// from a later release), either because the docs gave none or a later one.
 	Capped bool
+	// NonContiguous marks content whose range overlaps releases that are not
+	// adjacent (or that overlaps again after the component left the Stack):
+	// [Min, Below) is a superset that cannot express the gap. Reported as a warning.
+	NonContiguous bool
 	// MinTrivial marks a lower bound at or below the first Stack release: it
 	// restricts nothing, so no phrase names it. Min keeps its value.
 	MinTrivial bool
@@ -35,32 +39,36 @@ func (t *StackTable) Convert(component, minRaw, belowRaw string) Conversion {
 		component = "stack"
 	}
 	c := Conversion{Component: component, Below: NoUpperBound, MinRaw: minRaw, BelowRaw: belowRaw}
-	if minRaw != "" {
-		if v, ok := t.Lower(component, minRaw); ok {
+	if canonical(component) == "stack" {
+		c.convertStack()
+	} else {
+		t.convertComponent(&c)
+	}
+	if c.Min > 0 && !c.WidenedMin && c.Min <= t.firstStack() {
+		c.MinTrivial = true
+	}
+	return c
+}
+
+// convertStack converts Stack bounds directly: vX.Y is X*100+Y.
+func (c *Conversion) convertStack() {
+	if c.MinRaw != "" {
+		if v, ok := stackScale(c.MinRaw); ok {
 			c.Min = v
 		} else {
 			c.WidenedMin = true
 		}
 	}
-	if belowRaw != "" {
-		if v, ok := t.Upper(component, belowRaw); ok {
+	if c.BelowRaw != "" {
+		if v, ok := stackScale(c.BelowRaw); ok {
 			c.Below = v
 		} else {
 			c.WidenedBelow = true
 		}
 	}
-	if c.Min > 0 && !c.WidenedMin && c.Min <= t.firstStack() {
-		c.MinTrivial = true
-	}
-	if !c.WidenedBelow {
-		if limit, ok := t.leaveCap(component); ok && c.Below > limit {
-			c.Below, c.Capped = limit, true
-		}
-	}
 	if !c.Widened() && c.Min >= c.Below {
 		c.Empty = true
 	}
-	return c
 }
 
 // stackLabel renders a Stack-scale number: 302 -> "v3.2".

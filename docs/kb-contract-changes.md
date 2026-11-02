@@ -77,7 +77,7 @@ A doc sidecar has 11 keys. A ticket or fiche sidecar has 10, because `version_co
 
 ## 3. Stack-scale conversion rules
 
-The docs write bounds on several component scales. `docs-rag` converts every bound to the Stack scale with the `stack` component releases in `apps/docs/content/schema.ts`. The table is read from that file at publish time, so it holds every Stack release the file lists, upcoming ones included (v4.0 is upcoming today). Each release lists `requires` per component. A requirement is a point version (`3.0.18`) or a range (`{min, below}`). The "shipped version" of a release for a component is the lower bound of its range, or the point version.
+The docs write bounds on several component scales. `docs-rag` converts every bound to the Stack scale with the `stack` component releases in `apps/docs/content/schema.ts`. The table is read from that file at publish time, so it holds every Stack release the file lists, upcoming ones included (v4.0 is upcoming today). Each release lists `requires` per component. A requirement is a point version (`3.0.18`) or a range (`{min, below}`). A release allows a range of versions of each component: `{min, below}` is `[min, below)`, `{min}` alone is `[min, +inf)`, and a point version `p` is the single version `[p, p]`.
 
 `schema.ts` is the source of truth. Revisit at the v4.0 release: the v4.0 entry is marked upcoming and can change before it ships.
 
@@ -86,16 +86,21 @@ Add these rules as a new subsection of contract section 3, after "Version format
 | Case | Rule |
 | --- | --- |
 | Stack bound (`v3.2`) | Convert directly with `X*100+Y`. v3.2 is 302. |
-| Component lower bound `m` | The first Stack release, in release order, whose shipped version is `>= m`. Its number is `version_min`. No release ships it: not convertible. |
-| Component upper bound `b` | The first Stack release whose shipped version is `>= b`. The feature is gone from that release, so this is `version_below`. No such release: `99999`, unless the component leaves the Stack (see "Components that leave the Stack"). Example: if Stack v4.0 ships ledger 3.0.0, `below 3.0.0` gives `version_below` 400. |
-| `numscript-interpreter` bound `m` | Ledger releases require an interpreter range. Find the first ledger release whose interpreter `below` is greater than `m`. Then convert that ledger version through the Stack table. This is a cascade: stack, ledger, numscript-interpreter. When no Stack release ships that ledger version, an upper bound gives `99999` and a lower bound is not convertible. |
+| Component range `[m, b)` (either bound may be absent: `-inf` / `+inf`) | A Stack release is included iff the range it allows for the component **intersects** `[m, b)` (non-empty overlap). `below` is exclusive on both sides, so `[2.3.0, 2.4.0)` and `[2.4.0, 2.5.0)` do not intersect. A point version `p` intersects iff `m <= p < b`. `version_min` is the number of the first release that intersects (`0` when `m` is absent). `version_below` is the number of the release after the last one that intersects (`99999` when there is none). No release intersects: empty, the chunk is excluded. `m` above every version the table lists: not convertible (the content is for an unreleased version). Example: v3.1 allows ledger `[2.3.0, 2.4.0)` and v3.2 starts at 2.4.11, so content for ledger `[2.3.1, 2.4.0)` gets `[301, 302)`. |
+| `numscript-interpreter` range | Same rule at each level of the cascade stack, ledger, numscript-interpreter. The interpreter range is intersected with the interpreter range each ledger release bundles. Each matching ledger release applies from its version up to the next ledger entry. Their spans are merged into one ledger range (first start to last end), and that range is intersected with the `ledger` ranges of the Stack releases as above. Every ledger release in `schema.ts` declares an interpreter range starting at 0.0.10, so an interpreter bound with only `below` (for example below 0.0.20) intersects every ledger release and gives `version_below` 99999. This over-includes, which is the conservative direction. |
 | Component `orchestration` (written `flows` in docs) | The docs name `flows` is looked up as the schema id `orchestration`. The product of the chunk is `flows`. |
 | Component not in the Stack table | `membership`, `operator`, `fctl-*`, `sdk-*` and similar: not convertible. This holds for an upper bound too: a component that no Stack release lists has no `99999` fallback. |
 | Version that cannot be parsed | Not convertible. |
 
+### Why any overlap keeps the release
+
+The customer knows their Stack version, not the patch version of each component. A Stack release that allows ledger `[2.3.0, 2.4.0)` can run 2.3.0 or 2.3.9, so content valid for part of that range may apply, and the release is kept. This can show a chunk that does not apply to one customer. It never hides one that does.
+
+[min, below) must be one interval. If the releases that intersect are not adjacent (v3.0 and v3.2 but not v3.1), the conversion takes the superset from the first intersecting release up to the first release after the last one, and the dry-run lists the chunk under "WARNING: ranges overlapping non-adjacent Stack releases". With today's schema this does not happen: each component's versions only grow from one release to the next, so the intersecting releases are always adjacent. A component that leaves the Stack and comes back would be the exception, and there the cap below wins.
+
 ### Components that leave the Stack
 
-A component can disappear from a later Stack release. An upper bound is capped at the first Stack release, after one that lists the component, that no longer lists it. For example, `payments` is absent from the upcoming v4.0, so a payments bound with no upper limit gets `version_below` 400, not `99999`. A lower bound that converts at or after the cap gives an empty range. The chunk is excluded (see "Empty ranges are excluded").
+A component can disappear from a later Stack release. A release that no longer lists the component does not intersect anything, so the range is capped at the first Stack release, after one that lists the component, that no longer lists it. For example, `payments` is absent from the upcoming v4.0, so a payments bound with no upper limit gets `version_below` 400, not `99999`. A range is empty, and the chunk is excluded (see "Empty ranges are excluded"), only when no Stack release intersects it. A lower bound above every listed version is widened, not emptied. The cap deliberately wins: if a component leaves the Stack and is listed again in a later release, `version_below` stops at the first release that no longer lists it, even if a later release would intersect again. The dry-run prints the non-contiguous warning in that case. This does not happen with today's `schema.ts`.
 
 ### Widened chunks
 

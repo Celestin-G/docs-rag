@@ -13,15 +13,17 @@ import (
 // NoUpperBound is the version_below of content with no upper bound.
 const NoUpperBound = 99999
 
-// A Stack release lists, per component, the version it ships: a point version
-// ("3.0.18") or a range ({min, below}). Component bounds in the docs (a page for
+// A Stack release lists, per component, the versions it allows: a point version
+// ("3.0.18", exactly that one) or a range ({min, below}, or {min} alone, open
+// above). Component bounds in the docs (a page for
 // payments 3.3.0, a block for ledger below 3.0.0) mean nothing to a customer who
 // only knows their Stack version, so they are converted to the Stack scale with
 // this table. The table is read from the docs repo's schema.ts at publish time
 // rather than copied here, so it cannot drift.
 
 type requirement struct {
-	min, below string // below is empty for a point version
+	min, below string // below is empty for a point version and for a {min}-only range
+	point      bool   // written as a string ("3.0.18"): exactly that version
 }
 
 type release struct {
@@ -168,7 +170,7 @@ func componentReleases(src, id string) ([]release, error) {
 			if oi := strings.Index(entry[ri:], "{"); oi >= 0 {
 				if reqBody, ok := matchBrackets(entry[ri+oi:], '{', '}'); ok {
 					for _, m := range reqEntryRe.FindAllStringSubmatch(reqBody, -1) {
-						req := requirement{min: m[2]}
+						req := requirement{min: m[2], point: m[3] == ""}
 						if m[3] != "" {
 							req = requirement{}
 							if g := minFieldRe.FindStringSubmatch(m[3]); g != nil {
@@ -270,14 +272,64 @@ func stackScale(s string) (int, bool) {
 	return v[0]*100 + v[1], true
 }
 
-// shipped is the version of a component a release ships: the lower bound of its
-// range, or the point version.
-func (r release) shipped(component string) (semver, bool) {
-	req, ok := r.requires[component]
-	if !ok {
-		return nil, false
+// span is a range of versions: [lo, hi), or [lo, hi] when hiIncl (a point
+// version). A missing bound (hasLo / hasHi false) is unbounded on that side.
+type span struct {
+	lo, hi       semver
+	hasLo, hasHi bool
+	hiIncl       bool
+}
+
+// emptySpan overlaps nothing.
+var emptySpan = span{lo: semver{0}, hi: semver{0}, hasLo: true, hasHi: true}
+
+func (s span) empty() bool {
+	if !s.hasLo || !s.hasHi {
+		return false
 	}
-	return parseSemver(req.min)
+	c := s.lo.cmp(s.hi)
+	return c > 0 || (c == 0 && !s.hiIncl)
+}
+
+// loBelowHi reports whether some version at or above lo lies below hi.
+func loBelowHi(lo semver, hasLo bool, hi semver, hasHi, hiIncl bool) bool {
+	if !hasLo || !hasHi {
+		return true
+	}
+	c := lo.cmp(hi)
+	return c < 0 || (c == 0 && hiIncl)
+}
+
+// overlaps reports whether the two ranges share at least one version. The upper
+// bound is exclusive on both sides unless the range is a point version, so
+// [2.3.0, 2.4.0) and [2.4.0, 2.5.0) do not overlap, and a point p overlaps
+// [m, b) iff m <= p < b.
+func (a span) overlaps(b span) bool {
+	if a.empty() || b.empty() {
+		return false
+	}
+	return loBelowHi(a.lo, a.hasLo, b.hi, b.hasHi, b.hiIncl) &&
+		loBelowHi(b.lo, b.hasLo, a.hi, a.hasHi, a.hiIncl)
+}
+
+// span is the versions a release allows for a component. ok is false when the
+// requirement is not a version ("fctl-2.0").
+func (q requirement) span() (span, bool) {
+	lo, ok := parseSemver(q.min)
+	if !ok {
+		return span{}, false
+	}
+	switch {
+	case q.point:
+		return span{lo: lo, hasLo: true, hi: lo, hasHi: true, hiIncl: true}, true
+	case q.below == "":
+		return span{lo: lo, hasLo: true}, true
+	}
+	hi, ok := parseSemver(q.below)
+	if !ok {
+		return span{}, false
+	}
+	return span{lo: lo, hasLo: true, hi: hi, hasHi: true}, true
 }
 
 // canonical maps the docs' component names onto the schema's ids.
@@ -288,122 +340,202 @@ func canonical(component string) string {
 	return component
 }
 
-// Lower converts a component's lower bound to the first Stack release that ships
-// it. ok is false when the bound cannot be converted.
-func (t *StackTable) Lower(component, version string) (int, bool) {
-	component = canonical(component)
-	if component == "stack" {
-		return stackScale(version)
-	}
-	m, ok := parseSemver(version)
-	if !ok {
-		return 0, false
-	}
-	if component == "numscript-interpreter" {
-		return t.viaLedger(m, true)
-	}
-	for _, r := range t.stack {
-		if s, ok := r.shipped(component); ok && s.cmp(m) >= 0 {
-			scale, _ := stackScale(r.version)
-			return scale, true
-		}
-	}
-	return 0, false
-}
+const interpreter = "numscript-interpreter"
 
-// Upper converts a component's exclusive upper bound to the first Stack release
-// that ships a version at or above it (the feature is gone from there). A bound
-// no release reaches means the feature is never removed: NoUpperBound.
-func (t *StackTable) Upper(component, version string) (int, bool) {
-	component = canonical(component)
-	if component == "stack" {
-		return stackScale(version)
-	}
-	b, ok := parseSemver(version)
-	if !ok {
-		return 0, false
-	}
-	if component == "numscript-interpreter" {
-		return t.viaLedger(b, false)
-	}
-	if !t.knows(component) {
-		return 0, false
-	}
-	for _, r := range t.stack {
-		if s, ok := r.shipped(component); ok && s.cmp(b) >= 0 {
-			scale, _ := stackScale(r.version)
-			return scale, true
+// convertible reports whether some Stack release lists the component with a
+// version the table can read. The interpreter is convertible through Ledger.
+func (t *StackTable) convertible(component string) bool {
+	if component == interpreter {
+		if !t.convertible("ledger") {
+			return false
 		}
-	}
-	return NoUpperBound, true
-}
-
-// leaveCap is the Stack-scale number of the first release that no longer lists
-// the component after a release that did (payments, wallets, flows, reconciliation
-// and webhooks are absent from v4.0): content about it cannot apply from there.
-// numscript-interpreter is bundled in Ledger and follows Ledger's cap, never one
-// of its own. ok is false when the component never leaves the table.
-func (t *StackTable) leaveCap(component string) (int, bool) {
-	component = canonical(component)
-	switch component {
-	case "stack":
-		return 0, false
-	case "numscript-interpreter":
-		component = "ledger"
-	}
-	listed := false
-	for _, r := range t.stack {
-		if _, ok := r.requires[component]; ok {
-			listed = true
-		} else if listed {
-			scale, ok := stackScale(r.version)
-			return scale, ok
+		for _, lr := range t.ledger {
+			if req, ok := lr.requires[interpreter]; ok {
+				if _, ok := req.span(); ok {
+					return true
+				}
+			}
 		}
+		return false
 	}
-	return 0, false
-}
-
-// knows reports whether any Stack release lists the component.
-func (t *StackTable) knows(component string) bool {
 	for _, r := range t.stack {
-		if _, ok := r.requires[component]; ok {
-			return true
+		if req, ok := r.requires[component]; ok {
+			if _, ok := req.span(); ok {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-// viaLedger handles numscript-interpreter, which the Stack does not list: each
-// Ledger release bundles an interpreter and caps it at `below`. The first Ledger
-// release whose cap is above the bound ships it, and that Ledger version is then
-// converted through the Stack table (stack -> ledger -> numscript-interpreter).
-func (t *StackTable) viaLedger(m semver, lower bool) (int, bool) {
-	for _, lr := range t.ledger {
-		req, ok := lr.requires["numscript-interpreter"]
-		if !ok {
-			continue
-		}
-		below, ok := parseSemver(req.below)
-		if !ok || below.cmp(m) <= 0 {
-			continue
-		}
-		lv, ok := parseSemver(lr.version)
-		if !ok {
-			return 0, false
-		}
-		for _, sr := range t.stack {
-			if s, ok := sr.shipped("ledger"); ok && s.cmp(lv) >= 0 {
-				scale, _ := stackScale(sr.version)
-				return scale, true
+// reaches reports whether any release allows a version at or above m. When none
+// does, the bound is above everything the table knows (content for an
+// unreleased version) and is widened rather than excluded.
+func (t *StackTable) reaches(component string, m semver) bool {
+	above := span{lo: m, hasLo: true}
+	if component == interpreter {
+		_, found := t.ledgerSpan(above)
+		return found
+	}
+	for _, r := range t.stack {
+		if req, ok := r.requires[component]; ok {
+			if sp, ok := req.span(); !ok || sp.overlaps(above) {
+				return true
 			}
 		}
-		if lower {
-			return 0, false
+	}
+	return false
+}
+
+// ledgerSpan is the first step of the numscript-interpreter cascade. A Ledger
+// release entry bundles an interpreter range and applies from its own version up
+// to the next entry (the last one has no end). The entries whose interpreter range
+// overlaps the content range c are collected, and their Ledger spans are merged
+// into one hull [first start, last end): the Ledger versions an interpreter in c
+// may be bundled in. Entries without an interpreter requirement bundle none and
+// are skipped. The hull is a superset when the matching entries are not adjacent,
+// which keeps the conversion conservative. found is false when no entry matches.
+func (t *StackTable) ledgerSpan(c span) (hull span, found bool) {
+	for i, lr := range t.ledger {
+		req, ok := lr.requires[interpreter]
+		if !ok {
+			continue
 		}
-		return NoUpperBound, true
+		sp, ok := req.span()
+		lv, lok := parseSemver(lr.version)
+		if !ok || !lok || !sp.overlaps(c) {
+			continue
+		}
+		end, hasEnd := semver(nil), false
+		if i+1 < len(t.ledger) {
+			end, hasEnd = parseSemver(t.ledger[i+1].version)
+		}
+		if !found {
+			hull, found = span{lo: lv, hasLo: true, hi: end, hasHi: hasEnd}, true
+			continue
+		}
+		if lv.cmp(hull.lo) < 0 {
+			hull.lo = lv
+		}
+		if hull.hasHi && (!hasEnd || end.cmp(hull.hi) > 0) {
+			hull.hi, hull.hasHi = end, hasEnd
+		}
 	}
-	if lower {
-		return 0, false
+	return hull, found
+}
+
+// convertComponent converts the bounds of a component that is not the Stack
+// itself, by interval intersection (see docs/kb-contract-changes.md section 3).
+//
+// Each Stack release allows a range of the component's versions. The content
+// range C = [m, b) applies to a release iff the two overlap: the customer's exact
+// patch version is unknown, so any overlap keeps the release. version_min is the
+// first release that overlaps and version_below is the release after the last one
+// that does, so the result is [first, last+1). Overlapping releases are searched
+// only until the component leaves the Stack (the first release that no longer
+// lists it): that release does not overlap and is the cap.
+//
+// numscript-interpreter is not in the Stack table, so it is composed in two
+// steps with the same rule: C is intersected with each Ledger release's bundled
+// interpreter range (ledgerSpan), the matching releases give a Ledger version
+// span, and that span replaces C in the ordinary intersection over the Stack
+// releases' "ledger" ranges (stack -> ledger -> numscript-interpreter).
+//
+// A bound that cannot be converted (component not in the table, unparsable
+// version, or above every release) is widened on its own side only.
+func (t *StackTable) convertComponent(c *Conversion) {
+	comp := canonical(c.Component)
+	var m, b semver
+	var haveM, haveB bool
+	if c.MinRaw != "" {
+		if v, ok := parseSemver(c.MinRaw); ok {
+			m, haveM = v, true
+		} else {
+			c.WidenedMin = true
+		}
 	}
-	return NoUpperBound, len(t.ledger) > 0
+	if c.BelowRaw != "" {
+		if v, ok := parseSemver(c.BelowRaw); ok {
+			b, haveB = v, true
+		} else {
+			c.WidenedBelow = true
+		}
+	}
+	if !t.convertible(comp) {
+		c.WidenedMin = c.MinRaw != ""
+		c.WidenedBelow = c.BelowRaw != ""
+		return
+	}
+	if haveM && !t.reaches(comp, m) {
+		c.WidenedMin, haveM = true, false
+	}
+
+	content := span{lo: m, hasLo: haveM, hi: b, hasHi: haveB}
+	target := comp
+	if comp == interpreter {
+		target = "ledger"
+		if hull, found := t.ledgerSpan(content); found && !content.empty() {
+			content = hull
+		} else {
+			content = emptySpan
+		}
+	}
+
+	listed := make([]bool, len(t.stack))
+	hit := make([]bool, len(t.stack))
+	first := -1
+	for i, r := range t.stack {
+		req, ok := r.requires[target]
+		listed[i] = ok
+		if !ok {
+			continue
+		}
+		// A requirement the table cannot read ("fctl-2.0") cannot exclude a release.
+		sp, ok := req.span()
+		hit[i] = !content.empty() && (!ok || sp.overlaps(content))
+		if hit[i] && first < 0 {
+			first = i
+		}
+	}
+	if first < 0 {
+		// Nothing overlaps. Widened bounds stay wide; otherwise no release ships
+		// the range.
+		if !c.Widened() {
+			c.Empty = true
+			c.Min, c.Below = 0, 0
+		}
+		return
+	}
+
+	end := first // the run of releases that list the component
+	for end < len(t.stack) && listed[end] {
+		end++
+	}
+	last := first
+	for i := first; i < end; i++ {
+		if hit[i] {
+			last = i
+		}
+	}
+	for i := first + 1; i < last; i++ {
+		if !hit[i] {
+			c.NonContiguous = true
+		}
+	}
+	for i := end; i < len(t.stack); i++ {
+		if hit[i] {
+			c.NonContiguous = true // listed again after leaving: the cap wins
+		}
+	}
+
+	if haveM {
+		c.Min, _ = stackScale(t.stack[first].version)
+	}
+	if last+1 < len(t.stack) {
+		c.Below, _ = stackScale(t.stack[last+1].version)
+		c.Capped = last+1 == end
+	}
+	if c.WidenedBelow {
+		c.Below, c.Capped = NoUpperBound, false
+	}
 }

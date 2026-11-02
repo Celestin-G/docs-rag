@@ -97,6 +97,13 @@ func (r *Report) PrintSummary(w io.Writer, table *StackTable) {
 		fmt.Fprintf(w, "  %-6s %s  %s %s\n", level, x.File, x.Component, x.Bound)
 	}
 
+	if len(r.Gaps) > 0 {
+		fmt.Fprintf(w, "\nWARNING: ranges overlapping non-adjacent Stack releases, converted to a superset: %d\n", len(r.Gaps))
+		for _, x := range r.Gaps {
+			fmt.Fprintf(w, "  %s  %s %s\n", x.File, x.Component, x.Bound)
+		}
+	}
+
 	fmt.Fprintf(w, "\nsource_url fallbacks to the site root: %d\n", len(r.URLFallbacks))
 	for _, s := range r.URLFallbacks {
 		fmt.Fprintf(w, "  %s\n", s)
