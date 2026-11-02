@@ -196,6 +196,7 @@ func TestConvertCustomTables(t *testing.T) {
 		// z: listed in v3.0 and v3.2, absent from v3.1. y: v3.0 and v3.1 only.
 		{name: "overlap with v3.0 and v3.2 but not v3.1: superset to the cap, with a warning", schema: gap, component: "x", minRaw: "1.0.0", below: "2.0.0", min: 300, bel: 303, gap: true},
 		{name: "relisted after leaving: the cap wins, with a warning", schema: gap, component: "z", minRaw: "1.0.0", below: "2.0.0", min: 300, bel: 301, gap: true},
+		{name: "range only matched after the component left and came back: first match wins, no cap", schema: gap, component: "x", minRaw: "1.2.0", below: "1.3.0", min: 304, bel: NoUpperBound},
 		{name: "adjacent releases: no warning", schema: gap, component: "y", minRaw: "1.0.0", below: "2.0.0", min: 300, bel: 302},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
