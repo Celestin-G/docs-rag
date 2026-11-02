@@ -30,6 +30,13 @@ var (
 	// and it is a different mechanism from the version bounds above.
 	visibilityRe = regexp.MustCompile(`(?m)^visibility:\s*\{([^}]*)\}`)
 	visEntryRe   = regexp.MustCompile(`([A-Za-z0-9_-]+)\s*:\s*(\[[^\]]*\]|"[^"]*"|'[^']*'|[^,\s]+)`)
+
+	// Raw frontmatter strings, kept verbatim for consumers that need more than the
+	// lossy int16 form (see Chunk.VersionMinRaw).
+	pagePathRe     = regexp.MustCompile(`(?m)^path:\s*(.+)$`)
+	versionBlockRe = regexp.MustCompile(`(?m)^version:\s*\{([^}]*)\}`)
+	rawMinRe       = regexp.MustCompile(`\bmin:\s*["']?([^"',}\s]+)`)
+	rawBelowRe     = regexp.MustCompile(`\bbelow:\s*["']?([^"',}\s]+)`)
 )
 
 // stripMDX removes JSX/MDX components while preserving useful text content.
@@ -135,6 +142,29 @@ type Chunk struct {
 	// Values are always normalised to a slice, even when the frontmatter gives a
 	// single string, so consumers never have to handle both shapes.
 	Visibility map[string][]string
+
+	// The fields below are additive and informational: the ingest pipeline does
+	// not read them. They exist for the knowledge-base publisher, which needs the
+	// information the compact fields above throw away.
+
+	// PagePath is the frontmatter `path:` (the URL path the site routes on), Title
+	// the frontmatter title. Empty when absent.
+	PagePath string
+	Title    string
+	// VersionMinRaw and VersionBelowRaw are the version bounds exactly as written
+	// ("0.0.15", "v3.2", "3.0.0"). VersionNum cannot carry them: it keeps only
+	// major.minor and reads "0.0.15" as 0.
+	VersionMinRaw   string
+	VersionBelowRaw string
+	// Leaf is the text of the deepest heading of the section ("H3" for "H2 > H3"),
+	// empty for text before the first H2. SectionSeq numbers the sections of the
+	// file in order; the parts of one oversized section share it.
+	Leaf       string
+	SectionSeq int
+	// Breadcrumb is the "Title > H2 > H3" line that prefixes Content, and Body the
+	// text after it, so Content == Breadcrumb + "\n\n" + Body when Breadcrumb is set.
+	Breadcrumb string
+	Body       string
 }
 
 // pageMeta is what a page's frontmatter and path say about it.
@@ -145,6 +175,8 @@ type pageMeta struct {
 	deployment string
 	pageTitle  string
 	visibility map[string][]string
+
+	path, minRaw, belowRaw string
 }
 
 // parseMeta extracts metadata from frontmatter and file path.
@@ -182,6 +214,17 @@ func parseMeta(relPath string, raw []byte) pageMeta {
 	}
 	if g := pageTitleRe.FindStringSubmatch(fm); len(g) > 1 {
 		m.pageTitle = strings.Trim(strings.TrimSpace(g[1]), `"'`)
+	}
+	if g := pagePathRe.FindStringSubmatch(fm); len(g) > 1 {
+		m.path = strings.Trim(strings.TrimSpace(g[1]), `"'`)
+	}
+	if g := versionBlockRe.FindStringSubmatch(fm); len(g) > 1 {
+		if r := rawMinRe.FindStringSubmatch(g[1]); len(r) > 1 {
+			m.minRaw = r[1]
+		}
+		if r := rawBelowRe.FindStringSubmatch(g[1]); len(r) > 1 {
+			m.belowRaw = r[1]
+		}
 	}
 	if g := visibilityRe.FindStringSubmatch(fm); len(g) > 1 {
 		m.visibility = parseVisibility(g[1])
@@ -253,7 +296,7 @@ func ParseFile(relPath string, content []byte) []Chunk {
 	sections := splitBySections(content)
 
 	var chunks []Chunk
-	for _, s := range sections {
+	for si, s := range sections {
 		text := strings.TrimSpace(s.text)
 		if text == "" {
 			continue
@@ -282,6 +325,14 @@ func ParseFile(relPath string, content []byte) []Chunk {
 				VersionComponent: meta.component,
 				Deployment:       meta.deployment,
 				Visibility:       meta.visibility,
+				PagePath:         meta.path,
+				Title:            pageTitle,
+				VersionMinRaw:    meta.minRaw,
+				VersionBelowRaw:  meta.belowRaw,
+				Leaf:             s.leaf,
+				SectionSeq:       si,
+				Breadcrumb:       prefix,
+				Body:             part,
 			})
 		}
 	}
@@ -290,6 +341,7 @@ func ParseFile(relPath string, content []byte) []Chunk {
 
 type section struct {
 	heading string
+	leaf    string // deepest heading only, without the H2 breadcrumb
 	text    string
 }
 
@@ -337,7 +389,7 @@ func splitBySections(content []byte) []section {
 				sections = append(sections, current)
 			}
 			parentH2 = extractHeadingText(line)
-			current = section{heading: parentH2}
+			current = section{heading: parentH2, leaf: parentH2}
 			buf.Reset()
 		} else if isH3(line) {
 			if text := strings.TrimSpace(buf.String()); text != "" {
@@ -349,7 +401,7 @@ func splitBySections(content []byte) []section {
 			if parentH2 != "" {
 				fullHeading = parentH2 + " > " + h3
 			}
-			current = section{heading: fullHeading}
+			current = section{heading: fullHeading, leaf: h3}
 			buf.Reset()
 		} else {
 			buf.WriteString(line)

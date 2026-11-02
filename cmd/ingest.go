@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/celestingeniaut/docs-rag/internal/chunker"
+	"github.com/celestingeniaut/docs-rag/internal/docsource"
 	"github.com/celestingeniaut/docs-rag/internal/embedder"
 	"github.com/celestingeniaut/docs-rag/internal/store"
 	"github.com/spf13/cobra"
@@ -75,28 +76,7 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 		emb = embedder.New()
 	}
 
-	var files []string
-	err := filepath.WalkDir(docsPath, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			name := d.Name()
-			if strings.HasPrefix(name, ".") || name == "node_modules" || name == ".docusaurus" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if ext != ".md" && ext != ".mdx" && ext != ".json" {
-			return nil
-		}
-		rel, _ := filepath.Rel(docsPath, path)
-		if isDocFile(rel) {
-			files = append(files, path)
-		}
-		return nil
-	})
+	files, err := docsource.Walk(docsPath)
 	if err != nil {
 		return fmt.Errorf("walk %s: %w", docsPath, err)
 	}
@@ -118,7 +98,7 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 		if dry {
 			// Keep going after a bad file: the point of a dry run is the full list
 			// of what would break, not the first thing that does.
-			chunks, err = safeParse(relPath, content)
+			chunks, err = docsource.SafeParse(relPath, content)
 			if err != nil {
 				report.failed = append(report.failed, fmt.Sprintf("%s: %v", relPath, err))
 				continue
@@ -126,7 +106,7 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 			report.add(relPath, chunks)
 			continue
 		}
-		chunks = parseDoc(relPath, content)
+		chunks = docsource.Parse(relPath, content)
 		if len(chunks) == 0 {
 			continue
 		}
@@ -169,27 +149,6 @@ func runIngest(cmd *cobra.Command, _ []string) error {
 
 	fmt.Fprintf(os.Stderr, "\nDone — ingested %d chunks from %d files.\n", totalChunks, len(files))
 	return nil
-}
-
-// parseDoc turns one documentation file into chunks. The generated data files
-// are JSON envelopes rather than markdown, so they take a different parser.
-func parseDoc(rel string, content []byte) []chunker.Chunk {
-	if strings.EqualFold(filepath.Ext(rel), ".json") {
-		return chunker.ParseGeneratedJSON(rel, content)
-	}
-	return chunker.ParseFile(rel, content)
-}
-
-// safeParse is parseDoc with a panic turned into an error, used only by the dry
-// run. A real ingest lets a panic crash: a partially filled index is worse than
-// an obvious failure.
-func safeParse(rel string, content []byte) (chunks []chunker.Chunk, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic: %v", r)
-		}
-	}()
-	return parseDoc(rel, content), nil
 }
 
 // ingestReport is what a dry run observed. The counts exist to be compared
@@ -304,38 +263,4 @@ func (r *ingestReport) print(w io.Writer, found int) error {
 	}
 	fmt.Fprintln(w, "\nNo parse failure. A real run would refill the index.")
 	return nil
-}
-
-// isDocFile returns true only for files that are actual Formance user documentation.
-// This excludes project meta-files (CLAUDE.md, README.md at root) and internal
-// tooling packages (docs-framework, vcc) that pollute search results.
-func isDocFile(rel string) bool {
-	// The generated data files are the only JSON worth reading: they hold the API
-	// operations, request/response schemas and fctl commands that the reference
-	// pages render at build time. Every other JSON in the repo is tooling config.
-	if strings.HasSuffix(rel, ".json") {
-		return strings.HasPrefix(rel, "apps/docs/content/data/generated/")
-	}
-	// Named directories rather than all of apps/docs/content/. That directory
-	// also holds authoring templates and internal worklists, which are not
-	// published — and an allowlist means the next thing filed there stays out by
-	// default instead of quietly joining the index.
-	//
-	// Found through the version picker: the only page claiming stack 3.3 was
-	// connector-page.template.mdx, a blank template carrying 3.3 as an example
-	// value in its frontmatter. It invented a version that does not exist, and
-	// its boilerplate competed with real pages on connector questions.
-	for _, dir := range []string{
-		"apps/docs/content/pages/",     // the published documentation
-		"apps/docs/content/fragments/", // partials the pages include
-	} {
-		if strings.HasPrefix(rel, dir) {
-			return true
-		}
-	}
-	// Keep the numscript engine README which has useful technical content
-	if strings.HasPrefix(rel, "packages/numscript-engine/") {
-		return true
-	}
-	return false
 }

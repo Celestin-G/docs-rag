@@ -50,6 +50,29 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Build the rag binary
+        run: go build -o rag .
+
+      # Tests of scripts/kb-verify.sh against a fake aws (no AWS access).
+      - name: Verify the knowledge-base contract
+        run: bash tests/kb-verify/run.sh
+
   test:
     name: Test
     runs-on: ubuntu-latest
