@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
@@ -46,7 +47,7 @@ const (
 
 	// Grading routes: tiny bodies (a note is at most maxReviewNoteLen).
 	maxReviewGradeBytes = 16 << 10
-	maxReviewNoteLen    = 2000
+	maxReviewNoteLen    = 2000 // characters (runes), like the textarea maxlength
 
 	// Writers get a dedicated bucket: a reviewer clicking through items is
 	// far faster than someone asking questions, and must not share /api/ask's
@@ -110,7 +111,11 @@ func (s *srv) requireReviewAdmin(w http.ResponseWriter, r *http.Request) bool {
 		writeJSONError(w, http.StatusServiceUnavailable, "review admin routes are disabled: REVIEW_ADMIN_TOKEN is not set")
 		return false
 	}
-	if subtle.ConstantTimeCompare([]byte(r.Header.Get(reviewTokenHeader)), []byte(s.reviewToken)) != 1 {
+	// Compare fixed-length digests so the comparison time does not reveal the
+	// token's length.
+	got := sha256.Sum256([]byte(r.Header.Get(reviewTokenHeader)))
+	want := sha256.Sum256([]byte(s.reviewToken))
+	if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 		return false
 	}
@@ -127,6 +132,18 @@ func checkText(name, v string, max int, required bool) string {
 		return fmt.Sprintf("%s is too long (max %d bytes)", name, max)
 	case !utf8.ValidString(v) || strings.ContainsRune(v, 0):
 		return name + " contains invalid characters"
+	}
+	return ""
+}
+
+// checkNote validates the grade note. The cap counts characters, matching the
+// textarea's maxlength; the body size cap bounds the bytes.
+func checkNote(v string) string {
+	switch {
+	case !utf8.ValidString(v) || strings.ContainsRune(v, 0):
+		return "note contains invalid characters"
+	case utf8.RuneCountInString(v) > maxReviewNoteLen:
+		return fmt.Sprintf("note is too long (max %d characters)", maxReviewNoteLen)
 	}
 	return ""
 }
@@ -333,7 +350,7 @@ func (s *srv) handleReviewGrade(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, msg)
 		return
 	}
-	if msg := checkText("note", req.Note, maxReviewNoteLen, false); msg != "" {
+	if msg := checkNote(req.Note); msg != "" {
 		writeJSONError(w, http.StatusBadRequest, msg)
 		return
 	}

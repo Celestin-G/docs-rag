@@ -152,7 +152,7 @@ Import is **idempotent on `item_id` and never updates**: an `item_id` that alrea
 
 **Grading.** `GET /api/review/next` answers `{"done": false, "item": {"item_id", "ticket_key", "question", "draft_html", "team_reply"}, "progress": {"graded", "total"}}`, or `{"done": true, "item": null, "progress": {...}}` when nothing is left. `question` and `team_reply` are plain text (the page inserts them with `textContent`); `draft_html` is the draft rendered server-side with goldmark. Raw HTML is dropped, only `http`, `https` and `mailto` links survive (others become `#`), images become plain links, and every link gets `target="_blank" rel="noopener noreferrer"`. The `decision` and `score` from the import are not sent to reviewers, so they cannot bias the grade.
 
-`POST /api/review/grades` takes `{"item_id", "reviewer", "grade", "note"}` and answers `204`. `reviewer` is 8-64 characters of `A-Za-z0-9_-`, `grade` is `bad`, `meh` or `good`, `note` is at most 2 000 bytes, the body at most 16 KiB; an unknown item is `404`. Grading an item again replaces the earlier grade and note (one row per item and reviewer).
+`POST /api/review/grades` takes `{"item_id", "reviewer", "grade", "note"}` and answers `204`. `reviewer` is 8-64 characters of `A-Za-z0-9_-`, `grade` is `bad`, `meh` or `good`, `note` is at most 2 000 characters, the body at most 16 KiB; an unknown item is `404`. Grading an item again replaces the earlier grade and note (one row per item and reviewer).
 
 **Undo.** `DELETE /api/review/grades` takes `{"item_id", "reviewer"}` and removes only that reviewer's own grade. It answers `200` with that item in the same shape as `/api/review/next` (so the page shows it again), or `404` when that reviewer had no grade on it.
 

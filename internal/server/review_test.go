@@ -393,6 +393,8 @@ func TestReviewGradeValidation(t *testing.T) {
 		{"reviewer too short", gradeBody("i1", "short", "good", ""), http.StatusBadRequest},
 		{"reviewer too long", gradeBody("i1", strings.Repeat("a", 65), "good", ""), http.StatusBadRequest},
 		{"reviewer with bad characters", gradeBody("i1", "reviewer<script>", "good", ""), http.StatusBadRequest},
+		{"note at the cap in multibyte characters", gradeBody("i1", reviewerA, "meh", strings.Repeat("é", maxReviewNoteLen)), http.StatusNoContent},
+		{"note over the cap in multibyte characters", gradeBody("i1", reviewerA, "meh", strings.Repeat("é", maxReviewNoteLen+1)), http.StatusBadRequest},
 		{"note over the cap", gradeBody("i1", reviewerA, "good", strings.Repeat("n", maxReviewNoteLen+1)), http.StatusBadRequest},
 		{"NUL in note", gradeBody("i1", reviewerA, "good", "a\u0000b"), http.StatusBadRequest},
 		{"missing item_id", gradeBody("", reviewerA, "good", ""), http.StatusBadRequest},
@@ -596,6 +598,8 @@ func TestRenderReviewMarkdown(t *testing.T) {
 		{"html comment trick", "<!-- --><script>alert(1)</script>", nil, []string{"<script"}},
 		{"inline code with html", "`<img src=x onerror=alert(1)>`", []string{"&lt;img"}, []string{"<img"}},
 		{"autolink javascript text", "<javascript:alert(1)>", nil, []string{"href=\"javascript"}},
+		{"table alignment without inline style", "| a | b | c |\n|:--|:-:|--:|\n| 1 | 2 | 3 |", []string{"<table>", `align="center"`, `align="right"`}, []string{"style="}},
+		{"protocol-relative link neutralised", "[x](//evil.example/p)", []string{`href="#"`}, []string{"evil.example"}},
 		{"bare url is not linkified", "see https://example.com now", []string{"https://example.com"}, []string{"<a "}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -643,7 +647,12 @@ func TestAllowedURL(t *testing.T) {
 		{"JAVASCRIPT:alert(1)", false},
 		{"\x00javascript:alert(1)", false},
 		{" javascript:alert(1)", false},
-		{"//evil.example/x", true},
+		{"//evil.example/x", false},
+		{`/\evil.example/x`, false},
+		{`\/evil.example/x`, false},
+		{`\\evil.example/x`, false},
+		{"/\t/evil.example/x", false},
+		{"/a//b", true},
 		{"jav\nascript:x", false},
 	} {
 		t.Run(tc.url, func(t *testing.T) {

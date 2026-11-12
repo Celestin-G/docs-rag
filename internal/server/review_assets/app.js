@@ -7,6 +7,7 @@
   var REVIEWER_RE = /^[A-Za-z0-9_-]{8,64}$/;
   var SWIPE_MIN = 70;        // px for a touch swipe
   var WHEEL_MIN = 160;       // accumulated wheel delta for a trackpad swipe
+  var WHEEL_UP_MIN = 400;    // vertical (moyen) swipe needs a much larger gesture
   var WHEEL_QUIET_MS = 350;  // silence that ends a trackpad gesture (and its inertia)
 
   var $ = function (id) { return document.getElementById(id); };
@@ -56,6 +57,16 @@
     el.undo.disabled = b;
   }
 
+  // Short French messages by status; the server's English text is not shown.
+  function frenchError(status) {
+    if (status === 400) return 'Requête invalide (note trop longue ou caractères non valides).';
+    if (status === 404) return 'Introuvable : la carte n\u2019existe plus ou aucune note à annuler.';
+    if (status === 413) return 'Envoi trop volumineux.';
+    if (status === 429) return 'Trop de requêtes, patientez un instant.';
+    if (status >= 500) return 'Erreur du serveur, réessayez dans un instant.';
+    return 'Erreur ' + status + '.';
+  }
+
   function request(method, url, body) {
     var opts = { method: method, headers: {} };
     if (body) {
@@ -68,8 +79,9 @@
         var data = null;
         try { data = txt ? JSON.parse(txt) : null; } catch (e) { /* not JSON */ }
         if (!res.ok) {
-          var msg = (data && data.error) || (res.status === 429 ? 'Trop de requêtes, patientez un instant.' : 'Erreur ' + res.status);
-          throw new Error(msg);
+          var err = new Error(frenchError(res.status));
+          err.status = res.status;
+          throw err;
         }
         return data;
       });
@@ -126,7 +138,7 @@
         lastGraded = null;
         show(view);
       }).catch(function (e) {
-        if (/no grade/.test(e.message)) lastGraded = null;
+        if (e.status === 404) lastGraded = null;
         setStatus(e.message);
       }).then(function () { setBusy(false); });
   }
@@ -153,8 +165,17 @@
   // scroll during it (short card, or already at the bottom).
   var touch = null;
   function interactive(t) { return t && t.closest && t.closest('textarea, button, a, summary'); }
+  // True when the touch starts in a table/code block or any horizontally
+  // scrollable ancestor: swiping there scrolls the content, it is not a grade.
+  function inScrollable(t) {
+    if (t && t.closest && t.closest('table, pre, code')) return true;
+    for (var n = t; n && n.nodeType === 1; n = n.parentElement) {
+      if (n.scrollWidth > n.clientWidth && n !== document.documentElement && n !== document.body) return true;
+    }
+    return false;
+  }
   document.addEventListener('touchstart', function (e) {
-    if (e.touches.length !== 1 || interactive(e.target)) { touch = null; return; }
+    if (e.touches.length !== 1 || interactive(e.target) || inScrollable(e.target)) { touch = null; return; }
     var p = e.touches[0];
     touch = { x: p.clientX, y: p.clientY, scroll: window.scrollY };
   }, { passive: true });
@@ -175,25 +196,43 @@
   // Trackpad: accumulate wheel deltas into one gesture. After it fires, stay
   // locked until WHEEL_QUIET_MS without events so the inertia tail cannot
   // grade the next card. Direction assumes "natural" scrolling (swiping right
-  // gives negative deltaX). Vertical swipes only count when the gesture began at the
-  // bottom of the page so ordinary scrolling of a long draft is not hijacked.
-  var wheel = { x: 0, y: 0, last: 0, locked: false, startBottom: false };
+  // gives negative deltaX). Only pixel-mode wheel events (deltaMode 0, i.e. a
+  // trackpad) count: a mouse wheel reports lines or coarse pixel steps and must
+  // never grade. Vertical swipes also need a large accumulated delta and a
+  // gesture that began at the bottom of the page, so ordinary scrolling of a
+  // long draft is not hijacked.
+  //
+  // deltaMode 0 alone is not enough: Chrome on Windows/Linux sends ~100px per
+  // mouse-wheel notch (also as deltaX with shift). A trackpad instead streams
+  // many small deltas, so a gesture may only grade after WHEEL_MIN_EVENTS events
+  // that all look small. One notch-like event poisons the gesture until it ends.
+  var WHEEL_NOTCH_PX = 50, WHEEL_MIN_EVENTS = 8;
+  var wheel = { x: 0, y: 0, n: 0, last: 0, locked: false, poisoned: false, startBottom: false };
   function atPageBottom() { return window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2; }
+  // Notch signature: large pixel delta, or a legacy wheelDelta that is a
+  // non-zero multiple of 120 (the classic mouse-wheel step).
+  function looksLikeNotch(e) {
+    if (Math.abs(e.deltaX) >= WHEEL_NOTCH_PX || Math.abs(e.deltaY) >= WHEEL_NOTCH_PX) return true;
+    return (e.wheelDeltaY && e.wheelDeltaY % 120 === 0) || (e.wheelDeltaX && e.wheelDeltaX % 120 === 0);
+  }
   document.addEventListener('wheel', function (e) {
-    if (e.ctrlKey || !current || interactive(e.target)) return;
+    if (e.ctrlKey || !current || interactive(e.target) || inScrollable(e.target)) return;
     var now = Date.now();
     if (now - wheel.last > WHEEL_QUIET_MS) {
-      wheel.x = 0; wheel.y = 0; wheel.locked = false;
+      wheel.x = 0; wheel.y = 0; wheel.n = 0; wheel.locked = false; wheel.poisoned = false;
       wheel.startBottom = atPageBottom(); // a gesture that began mid-scroll never counts as a swipe up
     }
     wheel.last = now;
-    if (wheel.locked) return;
+    if (e.deltaMode !== 0 || looksLikeNotch(e)) wheel.poisoned = true;
+    if (wheel.locked || wheel.poisoned) return;
+    wheel.n++;
     wheel.x += e.deltaX;
     wheel.y += e.deltaY;
+    if (wheel.n < WHEEL_MIN_EVENTS) return;
     var g = null;
-    if (Math.abs(wheel.x) >= WHEEL_MIN && Math.abs(wheel.x) > Math.abs(wheel.y) * 1.5) {
+    if (Math.abs(wheel.x) >= WHEEL_MIN && Math.abs(wheel.x) > Math.abs(wheel.y) * 2) {
       g = wheel.x < 0 ? 'good' : 'bad';
-    } else if (wheel.y >= WHEEL_MIN && wheel.y > Math.abs(wheel.x) * 1.5 && wheel.startBottom) {
+    } else if (wheel.y >= WHEEL_UP_MIN && wheel.y > Math.abs(wheel.x) * 1.5 && wheel.startBottom) {
       g = 'meh';
     }
     if (g) {

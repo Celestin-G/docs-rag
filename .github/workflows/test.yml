@@ -133,11 +133,12 @@ jobs:
       # both spellings and matches all six without also matching the
       # DB-independent, never-skipping tests in testdb_edge_test.go
       # (TestWithSearchPath..., TestRandomSchemaName...,
-      # TestChunkTableDDL...).
+      # TestChunkTableDDL...). 'ReviewStore' adds TestReviewStore
+      # (review_test.go), which is DB-gated the same way.
       - name: Fail if DB-gated store tests were skipped
         run: |
           set -euo pipefail
-          go test -count=1 -v -run 'Stag|Visibility' ./internal/store/... | tee "$RUNNER_TEMP/store-db-tests.log"
+          go test -count=1 -v -run 'Stag|Visibility|ReviewStore' ./internal/store/... | tee "$RUNNER_TEMP/store-db-tests.log"
           if grep -q -- '--- SKIP' "$RUNNER_TEMP/store-db-tests.log"; then
             echo "::error::DB-gated store tests were skipped — the Postgres service container is not reachable via TEST_DATABASE_URL"
             exit 1

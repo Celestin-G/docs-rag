@@ -27,7 +27,11 @@ import (
 // The TeamReply and Question fields are never rendered as markdown or HTML:
 // the client inserts them with textContent.
 var reviewMD = goldmark.New(
-	goldmark.WithExtensions(extension.Strikethrough, extension.Table),
+	goldmark.WithExtensions(extension.Strikethrough,
+		// Alignment as align="..." attributes: the default inline style is
+		// blocked by the page CSP (style-src 'self').
+		extension.NewTable(extension.WithTableCellAlignMethod(extension.TableCellAlignAttribute)),
+	),
 	goldmark.WithParserOptions(
 		parser.WithASTTransformers(util.Prioritized(safeLinks{}, 100)),
 	),
@@ -114,6 +118,11 @@ func allowedURL(u string) bool {
 		}
 		return r
 	}, u)
+	// Protocol-relative URLs ("//host", and "\\" / "/\" which browsers
+	// normalise to "//") would point at an arbitrary host.
+	if len(u) >= 2 && (u[0] == '/' || u[0] == '\\') && (u[1] == '/' || u[1] == '\\') {
+		return false
+	}
 	i := strings.IndexAny(u, ":/?#")
 	if i < 0 || u[i] != ':' {
 		return true // no scheme: relative reference
