@@ -129,6 +129,51 @@ Both tables are created with `IF NOT EXISTS` and survive `migrate` runs (only `d
 
 ---
 
+## Review page
+
+An internal page where teammates grade the support bot's draft answers (the bot lives in `formancehq/support-agent`). One card at a time: the customer question, the bot's answer (rendered markdown, links open in a new tab), and the team's real reply folded away for comparison. Grades are **faux** (`bad`), **moyen** (`meh`: useful but needs editing) or **juste** (`good`), with an optional note. Swipe on a phone or trackpad, use the arrow keys (left, up, right), or tap the buttons.
+
+There is no login: the service is only reachable over Tailscale, and the page asks nobody for a name. Each browser keeps a random reviewer id in `localStorage` (in memory if storage is blocked). Clearing browser data makes you a new reviewer.
+
+| Route | Auth | Purpose |
+|-------|------|---------|
+| `GET /review` | none | The grading page. Served with a strict Content-Security-Policy (no inline script or style, no images, same-origin only); JS and CSS come from `/review/app.js` and `/review/app.css`. |
+| `GET /api/review/next?reviewer=<id>` | none | Next item this reviewer has not graded. Items with the fewest grades come first. |
+| `POST /api/review/grades` | none | Grade an item (upsert). |
+| `DELETE /api/review/grades` | none | Undo ("annuler"): delete the caller's own grade. |
+| `POST /api/review/batches` | `x-review-token` | Import a batch of drafts. |
+| `GET /api/review/results?batch_id=<id>` | `x-review-token` | List every grade of a batch. |
+
+The two admin routes compare the `x-review-token` header with `REVIEW_ADMIN_TOKEN` in constant time. **There is no default**: when `REVIEW_ADMIN_TOKEN` is unset both routes answer `503`; a missing or wrong token gets `401`. The three grading routes are open and validate every field instead. All write routes share one per-IP rate limiter (120 req/min, burst 30), separate from `/api/ask`.
+
+**Import.** `POST /api/review/batches` with `{"batch_id": "...", "items": [{"item_id", "ticket_key", "question", "draft", "team_reply", "decision", "score"}]}`. `item_id`, `question` and `draft` are required (so is `batch_id`); `ticket_key`, `team_reply`, `decision` and `score` are optional. Limits: body 8 MiB (`413`), 500 items, `item_id`/`batch_id` 200 bytes, `question` 20 000, `draft` and `team_reply` 100 000, `ticket_key` 100, `decision` 100; no NUL bytes. The whole request is validated first (`400` names the bad item), then inserted in one transaction. The response is `{"batch_id", "received", "inserted", "skipped"}`.
+
+Import is **idempotent on `item_id` and never updates**: an `item_id` that already exists is skipped (`ON CONFLICT DO NOTHING`), even if the new draft differs or the item came under another `batch_id`. That keeps every grade attached to the exact text that was graded. To re-grade a changed draft, send it under a new `item_id`.
+
+**Grading.** `GET /api/review/next` answers `{"done": false, "item": {"item_id", "ticket_key", "question", "draft_html", "team_reply"}, "progress": {"graded", "total"}}`, or `{"done": true, "item": null, "progress": {...}}` when nothing is left. `question` and `team_reply` are plain text (the page inserts them with `textContent`); `draft_html` is the draft rendered server-side with goldmark. Raw HTML is dropped, only `http`, `https` and `mailto` links survive (others become `#`), images become plain links, and every link gets `target="_blank" rel="noopener noreferrer"`. The `decision` and `score` from the import are not sent to reviewers, so they cannot bias the grade.
+
+`POST /api/review/grades` takes `{"item_id", "reviewer", "grade", "note"}` and answers `204`. `reviewer` is 8-64 characters of `A-Za-z0-9_-`, `grade` is `bad`, `meh` or `good`, `note` is at most 2 000 bytes, the body at most 16 KiB; an unknown item is `404`. Grading an item again replaces the earlier grade and note (one row per item and reviewer).
+
+**Undo.** `DELETE /api/review/grades` takes `{"item_id", "reviewer"}` and removes only that reviewer's own grade. It answers `200` with that item in the same shape as `/api/review/next` (so the page shows it again), or `404` when that reviewer had no grade on it.
+
+**Results.** `GET /api/review/results?batch_id=b1` answers `{"batch_id": "b1", "grades": [{"item_id", "reviewer_id", "grade", "note", "created_at"}]}`, ordered by item. `created_at` is the time of the latest grade (a regrade updates it).
+
+```bash
+# Import a batch (same call twice: the second reports "inserted": 0)
+curl -sS -X POST https://rag.example.com/api/review/batches \
+  -H "x-review-token: $REVIEW_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"batch_id":"2026-11-12","items":[{"item_id":"SUP-123-a","ticket_key":"SUP-123","question":"How do I ...?","draft":"Use **numscript** ... [docs](https://docs.formance.com)","team_reply":"...","decision":"send","score":0.82}]}'
+# {"batch_id":"2026-11-12","received":1,"inserted":1,"skipped":0}
+
+# Fetch the grades
+curl -sS -H "x-review-token: $REVIEW_ADMIN_TOKEN" \
+  "https://rag.example.com/api/review/results?batch_id=2026-11-12"
+```
+
+**Deploying.** Set `REVIEW_ADMIN_TOKEN` in the server's environment (a long random string; without it the import and results routes stay disabled), and run `rag migrate` to create `review_items` and `review_grades` (idempotent, safe to re-run; existing tables are untouched). With nginx, `/review` and `/api/review/*` already fall under `location /`; `nginx.conf` adds one block for `POST /api/review/batches` that raises `client_max_body_size` to 9m (nginx's 1m default would reject large batches). Share the `/review` URL with teammates on the Tailscale network.
+
+---
+
 ## Automated docs updates (GitHub Action)
 
 `.github/workflows/update-docs.yml` is scheduled to run **every day at 08:00 UTC** (and on manual trigger): it SSHes into the server, pulls the latest Formance docs, and re-ingests the index.
@@ -342,6 +387,7 @@ go run . publish-kb       Publish the docs to the Bedrock Knowledge Base (dry ru
 | `LLM_MODEL` | no | `qwen2.5:32b` | Generation model id — e.g. `qwen2.5:32b` (local) or `claude-opus-5` (LiteLLM) |
 | `TRUSTED_PROXIES` | no | `127.0.0.1/32,::1/128` | Comma-separated CIDRs allowed to set `X-Forwarded-For`/`X-Real-IP`. Invalid CIDRs fail server startup. |
 | `MCP_TOKEN` | no | — | Bearer token required on `/api/mcp` (`Authorization: Bearer <token>`). Left unset, the endpoint stays open and the server logs a startup warning. |
+| `REVIEW_ADMIN_TOKEN` | no | — | Token for the review admin routes (`x-review-token` header, constant-time compare). **No default:** unset makes `POST /api/review/batches` and `GET /api/review/results` answer `503`. See [Review page](#review-page). |
 | `SHUTDOWN_TIMEOUT` | no | `20s` | How long `serve` waits, on SIGINT/SIGTERM, for in-flight `/api/ask` and MCP requests to finish before forcibly cancelling everything still running. Open MCP GET streams are closed immediately regardless (see below). Rejected (falls back to the default) if zero, negative, or otherwise malformed — `time.ParseDuration` format (e.g. `45s`, `1m`). |
 | `ANSWER_TRANSLATE_TIMEOUT` | no | `10s` | Per-request budget for the translate stage. On timeout the pipeline falls back to the original question, same as on any other translate error (logged as `translate fallback: ...`). |
 | `ANSWER_EMBED_TIMEOUT` | no | `10s` | Per-request budget for the embed stage. |

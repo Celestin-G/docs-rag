@@ -70,6 +70,9 @@ CREATE TABLE IF NOT EXISTS request_logs (
   status       TEXT NOT NULL,
   created_at   TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Review page (see internal/store/review.go): review_items and review_grades.
+%s
 `
 
 var migrateCmd = &cobra.Command{
@@ -92,7 +95,7 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 	}
 	defer st.Close()
 
-	if err := st.Exec(ctx, fmt.Sprintf(migrationSQL, store.ChunkTableDDL("doc_chunks", true))); err != nil {
+	if err := st.Exec(ctx, fmt.Sprintf(migrationSQL, store.ChunkTableDDL("doc_chunks", true), store.ReviewTablesDDL)); err != nil {
 		return fmt.Errorf("apply migration: %w", err)
 	}
 

@@ -153,6 +153,15 @@ type srv struct {
 
 	askLimiter *rateLimiter
 	mcpLimiter *rateLimiter
+	// reviewLimiter throttles the review page's write routes and the admin
+	// routes (see review.go).
+	reviewLimiter *rateLimiter
+
+	// review is also satisfied by store, set to it in New (see reviewStore).
+	review reviewStore
+	// reviewToken is REVIEW_ADMIN_TOKEN. No default: when empty the review
+	// admin routes answer 503.
+	reviewToken string
 
 	// trustedProxies gates which RemoteAddr values may hand the app a client
 	// IP via X-Forwarded-For / X-Real-IP — see clientIP.
@@ -387,6 +396,8 @@ func (h *Server) ForceCancel() { h.s.forceCancel() }
 //   - TRUSTED_PROXIES : comma-separated CIDRs allowed to set X-Forwarded-For /
 //     X-Real-IP (default "127.0.0.1/32,::1/128", matching nginx on the same host)
 //   - MCP_TOKEN        : optional Bearer token required on /api/mcp
+//   - REVIEW_ADMIN_TOKEN : token for the review admin routes (header
+//     x-review-token); no default, unset makes them answer 503
 //   - ANSWER_TRANSLATE_TIMEOUT, ANSWER_EMBED_TIMEOUT, ANSWER_SEARCH_TIMEOUT,
 //     ANSWER_TOTAL_BUDGET : per-stage pipeline timeouts (see answer.go),
 //     time.ParseDuration format; default* constants above apply when unset
@@ -410,6 +421,9 @@ func New(st *store.Store, emb *embedder.Embedder, lm *llm.Client) (*Server, erro
 		logger:            st,
 		askLimiter:        newRateLimiter(ratePerMinute, rateBurst),
 		mcpLimiter:        newRateLimiter(mcpRatePerMinute, mcpRateBurst),
+		reviewLimiter:     newRateLimiter(reviewRatePerMinute, reviewRateBurst),
+		review:            st,
+		reviewToken:       os.Getenv("REVIEW_ADMIN_TOKEN"),
 		trustedProxies:    trustedProxies,
 		mcpToken:          mcpToken,
 		streamCtx:         streamCtx,
@@ -426,6 +440,17 @@ func New(st *store.Store, emb *embedder.Embedder, lm *llm.Client) (*Server, erro
 	mux.HandleFunc("GET /", s.handleIndex)
 	mux.HandleFunc("POST /api/ask", s.withRateLimit(s.askLimiter, s.handleAsk))
 	mux.HandleFunc("POST /api/feedback", s.withRateLimit(s.askLimiter, s.handleFeedback))
+	// Review page (see review.go). The two admin routes check
+	// REVIEW_ADMIN_TOKEN themselves; the grading routes are open on purpose
+	// (internal network only) and validate every field instead.
+	mux.HandleFunc("GET /review", s.serveReviewAsset("index.html", "text/html; charset=utf-8", true))
+	mux.HandleFunc("GET /review/app.js", s.serveReviewAsset("app.js", "text/javascript; charset=utf-8", false))
+	mux.HandleFunc("GET /review/app.css", s.serveReviewAsset("app.css", "text/css; charset=utf-8", false))
+	mux.HandleFunc("GET /api/review/next", s.handleReviewNext)
+	mux.HandleFunc("POST /api/review/grades", s.withRateLimit(s.reviewLimiter, s.handleReviewGrade))
+	mux.HandleFunc("DELETE /api/review/grades", s.withRateLimit(s.reviewLimiter, s.handleReviewUndo))
+	mux.HandleFunc("POST /api/review/batches", s.withRateLimit(s.reviewLimiter, s.handleReviewBatch))
+	mux.HandleFunc("GET /api/review/results", s.withRateLimit(s.reviewLimiter, s.handleReviewResults))
 	mux.HandleFunc("GET /api/stats", s.handleStatsJSON)
 	mux.HandleFunc("GET /stats", s.handleStatsPage)
 	// Liveness/readiness probes: deliberately not behind withRateLimit (an
@@ -588,6 +613,7 @@ func (s *srv) cleanupLimiters() {
 		cutoff := time.Now().Add(-expireAfter).UnixNano()
 		s.askLimiter.cleanup(cutoff)
 		s.mcpLimiter.cleanup(cutoff)
+		s.reviewLimiter.cleanup(cutoff)
 	}
 }
 

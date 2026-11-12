@@ -12,6 +12,8 @@ require (
 
 require github.com/aws/aws-sdk-go-v2/service/bedrockagent v1.69.2
 
+require github.com/yuin/goldmark v1.8.2
+
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.5
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.10 // indirect

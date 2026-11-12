@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Relecture des réponses</title>
+<link rel="stylesheet" href="/review/app.css">
+</head>
+<body>
+<main>
+  <header class="top">
+    <span id="progress" aria-live="polite"></span>
+    <button id="undo" class="linklike" type="button" hidden>annuler</button>
+  </header>
+
+  <p id="loading" class="muted">Chargement…</p>
+
+  <article id="card" class="card" hidden>
+    <h2 class="label">Question du client</h2>
+    <p id="question" class="question"></p>
+
+    <h2 class="label">Réponse du bot</h2>
+    <div id="draft" class="draft"></div>
+
+    <details id="reply-box" class="reply-box">
+      <summary>Réponse de l’équipe (pour comparer)</summary>
+      <p id="reply" class="reply"></p>
+    </details>
+
+    <div class="actions" role="group" aria-label="Noter la réponse">
+      <button type="button" class="grade bad" data-grade="bad" aria-label="Faux (flèche gauche)">
+        <span class="glyph" aria-hidden="true">✗</span><span class="word">faux</span>
+      </button>
+      <button type="button" class="grade meh" data-grade="meh" aria-label="Moyen : utile mais à retoucher (flèche haut)">
+        <span class="glyph" aria-hidden="true">~</span><span class="word">moyen</span>
+      </button>
+      <button type="button" class="grade good" data-grade="good" aria-label="Juste (flèche droite)">
+        <span class="glyph" aria-hidden="true">✓</span><span class="word">juste</span>
+      </button>
+    </div>
+    <p class="hint">← faux &nbsp;·&nbsp; ↑ moyen &nbsp;·&nbsp; → juste</p>
+
+    <label class="sr-only" for="note">Note</label>
+    <textarea id="note" rows="3" maxlength="2000" placeholder="Ajouter une note, si vous voulez"></textarea>
+  </article>
+
+  <section id="done" class="done" hidden>
+    <p class="done-mark" aria-hidden="true">✓</p>
+    <h1>Merci, tout est noté</h1>
+  </section>
+
+  <p id="status" class="status" role="status"></p>
+</main>
+<script src="/review/app.js" defer></script>
+</body>
+</html>
