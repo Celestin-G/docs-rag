@@ -491,7 +491,7 @@ func TestReviewPageAndAssets(t *testing.T) {
 	if strings.Contains(strings.ReplaceAll(html, `<script src="/review/app.js" defer></script>`, ""), "<script") {
 		t.Error("index.html has an inline script")
 	}
-	for _, want := range []string{"Merci, tout est noté", "Réponse de l’équipe (pour comparer)", "Ajouter une note, si vous voulez", "annuler"} {
+	for _, want := range []string{"All done, thanks!", "Team's reply (for comparison)", "Add a note (optional)", "Undo"} {
 		if !strings.Contains(html, want) {
 			t.Errorf("index.html lacks %q", want)
 		}

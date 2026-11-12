@@ -7,7 +7,7 @@
   var REVIEWER_RE = /^[A-Za-z0-9_-]{8,64}$/;
   var SWIPE_MIN = 70;        // px for a touch swipe
   var WHEEL_MIN = 160;       // accumulated wheel delta for a trackpad swipe
-  var WHEEL_UP_MIN = 400;    // vertical (moyen) swipe needs a much larger gesture
+  var WHEEL_UP_MIN = 400;    // vertical (needs work) swipe needs a much larger gesture
   var WHEEL_QUIET_MS = 350;  // silence that ends a trackpad gesture (and its inertia)
 
   var $ = function (id) { return document.getElementById(id); };
@@ -46,7 +46,7 @@
 
   var reviewer = reviewerId();
   var current = null;   // item on screen
-  var lastGraded = null; // item_id of the last grade, for "annuler"
+  var lastGraded = null; // item_id of the last grade, for undo
   var busy = false;
 
   function setStatus(msg) { el.status.textContent = msg || ''; }
@@ -57,14 +57,14 @@
     el.undo.disabled = b;
   }
 
-  // Short French messages by status; the server's English text is not shown.
-  function frenchError(status) {
-    if (status === 400) return 'Requête invalide (note trop longue ou caractères non valides).';
-    if (status === 404) return 'Introuvable : la carte n\u2019existe plus ou aucune note à annuler.';
-    if (status === 413) return 'Envoi trop volumineux.';
-    if (status === 429) return 'Trop de requêtes, patientez un instant.';
-    if (status >= 500) return 'Erreur du serveur, réessayez dans un instant.';
-    return 'Erreur ' + status + '.';
+  // Short English messages by status; the server's own text is not shown.
+  function errorMessage(status) {
+    if (status === 400) return 'Invalid request (note too long or invalid characters).';
+    if (status === 404) return 'Not found: the card is gone or there is no grade to undo.';
+    if (status === 413) return 'Request too large.';
+    if (status === 429) return 'Too many requests, wait a moment.';
+    if (status >= 500) return 'Server error, try again in a moment.';
+    return 'Error ' + status + '.';
   }
 
   function request(method, url, body) {
@@ -79,7 +79,7 @@
         var data = null;
         try { data = txt ? JSON.parse(txt) : null; } catch (e) { /* not JSON */ }
         if (!res.ok) {
-          var err = new Error(frenchError(res.status));
+          var err = new Error(errorMessage(res.status));
           err.status = res.status;
           throw err;
         }
@@ -216,6 +216,7 @@
     return (e.wheelDeltaY && e.wheelDeltaY % 120 === 0) || (e.wheelDeltaX && e.wheelDeltaX % 120 === 0);
   }
   document.addEventListener('wheel', function (e) {
+    if (e.shiftKey) return; // shift+wheel is horizontal mouse scrolling, never a trackpad swipe
     if (e.ctrlKey || !current || interactive(e.target) || inScrollable(e.target)) return;
     var now = Date.now();
     if (now - wheel.last > WHEEL_QUIET_MS) {

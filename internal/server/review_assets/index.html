@@ -1,54 +1,54 @@
 <!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <meta name="referrer" content="no-referrer">
-<title>Relecture des réponses</title>
+<title>Review bot answers</title>
 <link rel="stylesheet" href="/review/app.css">
 </head>
 <body>
 <main>
   <header class="top">
     <span id="progress" aria-live="polite"></span>
-    <button id="undo" class="linklike" type="button" hidden>annuler</button>
+    <button id="undo" class="linklike" type="button" hidden>Undo</button>
   </header>
 
-  <p id="loading" class="muted">Chargement…</p>
+  <p id="loading" class="muted">Loading…</p>
 
   <article id="card" class="card" hidden>
-    <h2 class="label">Question du client</h2>
+    <h2 class="label">Customer question</h2>
     <p id="question" class="question"></p>
 
-    <h2 class="label">Réponse du bot</h2>
+    <h2 class="label">Bot's answer</h2>
     <div id="draft" class="draft"></div>
 
     <details id="reply-box" class="reply-box">
-      <summary>Réponse de l’équipe (pour comparer)</summary>
+      <summary>Team's reply (for comparison)</summary>
       <p id="reply" class="reply"></p>
     </details>
 
-    <div class="actions" role="group" aria-label="Noter la réponse">
-      <button type="button" class="grade bad" data-grade="bad" aria-label="Faux (flèche gauche)">
-        <span class="glyph" aria-hidden="true">✗</span><span class="word">faux</span>
+    <div class="actions" role="group" aria-label="Grade the answer">
+      <button type="button" class="grade bad" data-grade="bad" aria-label="Wrong (left arrow)">
+        <span class="glyph" aria-hidden="true">✗</span><span class="word">Wrong</span>
       </button>
-      <button type="button" class="grade meh" data-grade="meh" aria-label="Moyen : utile mais à retoucher (flèche haut)">
-        <span class="glyph" aria-hidden="true">~</span><span class="word">moyen</span>
+      <button type="button" class="grade meh" data-grade="meh" aria-label="Needs work: useful but needs editing (up arrow)">
+        <span class="glyph" aria-hidden="true">~</span><span class="word">Needs work</span>
       </button>
-      <button type="button" class="grade good" data-grade="good" aria-label="Juste (flèche droite)">
-        <span class="glyph" aria-hidden="true">✓</span><span class="word">juste</span>
+      <button type="button" class="grade good" data-grade="good" aria-label="Good (right arrow)">
+        <span class="glyph" aria-hidden="true">✓</span><span class="word">Good</span>
       </button>
     </div>
-    <p class="hint">← faux &nbsp;·&nbsp; ↑ moyen &nbsp;·&nbsp; → juste</p>
+    <p class="hint">← Wrong &nbsp;·&nbsp; ↑ Needs work &nbsp;·&nbsp; → Good</p>
 
     <label class="sr-only" for="note">Note</label>
-    <textarea id="note" rows="3" maxlength="2000" placeholder="Ajouter une note, si vous voulez"></textarea>
+    <textarea id="note" rows="3" maxlength="2000" placeholder="Add a note (optional)"></textarea>
   </article>
 
   <section id="done" class="done" hidden>
     <p class="done-mark" aria-hidden="true">✓</p>
-    <h1>Merci, tout est noté</h1>
+    <h1>All done, thanks!</h1>
   </section>
 
   <p id="status" class="status" role="status"></p>

@@ -131,7 +131,7 @@ Both tables are created with `IF NOT EXISTS` and survive `migrate` runs (only `d
 
 ## Review page
 
-An internal page where teammates grade the support bot's draft answers (the bot lives in `formancehq/support-agent`). One card at a time: the customer question, the bot's answer (rendered markdown, links open in a new tab), and the team's real reply folded away for comparison. Grades are **faux** (`bad`), **moyen** (`meh`: useful but needs editing) or **juste** (`good`), with an optional note. Swipe on a phone or trackpad, use the arrow keys (left, up, right), or tap the buttons.
+An internal page where teammates grade the support bot's draft answers (the bot lives in `formancehq/support-agent`). One card at a time: the customer question, the bot's answer (rendered markdown, links open in a new tab), and the team's real reply folded away for comparison. Grades are **Wrong** (`bad`), **Needs work** (`meh`: useful but needs editing) or **Good** (`good`), with an optional note. Swipe on a phone or trackpad, use the arrow keys (left, up, right), or tap the buttons. Shift+wheel is ignored: it is horizontal mouse scrolling, not a trackpad swipe.
 
 There is no login: the service is only reachable over Tailscale, and the page asks nobody for a name. Each browser keeps a random reviewer id in `localStorage` (in memory if storage is blocked). Clearing browser data makes you a new reviewer.
 
@@ -140,7 +140,7 @@ There is no login: the service is only reachable over Tailscale, and the page as
 | `GET /review` | none | The grading page. Served with a strict Content-Security-Policy (no inline script or style, no images, same-origin only); JS and CSS come from `/review/app.js` and `/review/app.css`. |
 | `GET /api/review/next?reviewer=<id>` | none | Next item this reviewer has not graded. Items with the fewest grades come first. |
 | `POST /api/review/grades` | none | Grade an item (upsert). |
-| `DELETE /api/review/grades` | none | Undo ("annuler"): delete the caller's own grade. |
+| `DELETE /api/review/grades` | none | Undo: delete the caller's own grade. |
 | `POST /api/review/batches` | `x-review-token` | Import a batch of drafts. |
 | `GET /api/review/results?batch_id=<id>` | `x-review-token` | List every grade of a batch. |
 

@@ -372,7 +372,7 @@ type reviewUndoReq struct {
 	Reviewer string `json:"reviewer"`
 }
 
-// handleReviewUndo deletes the caller's own grade of an item (the "annuler"
+// handleReviewUndo deletes the caller's own grade of an item (the "Undo"
 // link) and answers with that item in the same shape as /api/review/next, so
 // the page can show it again. 404 when this reviewer had no grade on it.
 func (s *srv) handleReviewUndo(w http.ResponseWriter, r *http.Request) {
